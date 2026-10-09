@@ -656,9 +656,9 @@ function holdOpenCode(provider, options, hear, left) {
       await stopping;
       if (active !== turn || disposed) return;
       if (images?.length) throw new Error("OpenCode + Ollama accepts text only.");
-      ready ??= prepare().catch((error) => {
+      ready ??= prepare().catch((error2) => {
         ready = void 0;
-        throw error;
+        throw error2;
       });
       await ready;
       if (active !== turn || disposed) return;
@@ -683,6 +683,8 @@ function holdOpenCode(provider, options, hear, left) {
       if (active !== turn || disposed) return;
       const saved = await transport.request(root, `/session/${id}/message`, "GET", void 0, turn.controller.signal);
       if (active !== turn || disposed) return;
+      const final = saved.findLast(({ info }) => info.role === "assistant" && !sealedMessages.has(info.id));
+      const reply = final?.parts.some((part) => part.type === "text" && !part.ignored && !part.synthetic && part.text?.trim());
       for (const { info, parts: finalParts } of saved) {
         if (sealedMessages.has(info.id)) continue;
         updateInfo(info);
@@ -692,7 +694,8 @@ function holdOpenCode(provider, options, hear, left) {
           sealedParts.add(part.id);
         }
       }
-      finish(turn, result.info.error ? "failed" : "done", result.info.error ? errorText(result.info.error) : void 0);
+      const error = result.info.error ? errorText(result.info.error) : reply ? void 0 : "OpenCode finished without a final text reply. Try another model or send again.";
+      finish(turn, error ? "failed" : "done", error);
     } catch (error) {
       if (active === turn) fail(error);
     }

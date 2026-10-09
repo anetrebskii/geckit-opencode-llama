@@ -9,6 +9,7 @@ import { create } from '../src/provider.mjs'
 import { OpenCodeTransport } from '../src/transport.mjs'
 import { catalog, conversation, family, nativeId, partItem } from '../src/transcript.mjs'
 import { Backend } from './backend.mjs'
+import { v2Message } from '../src/v2-transcript.mjs'
 
 const until = async (condition) => {
   for (let i = 0; i < 100; i++) {
@@ -309,6 +310,49 @@ test('model failure and stream disconnect release active turn once', async (t) =
   await until(() => h.signals().filter((signal) => signal.kind === 'ended').length === 2)
   assert.match(h.signals().findLast((signal) => signal.kind === 'ended').text, /disconnected/)
   await h.driver.end()
+})
+
+test('successful native completion without a final text reply fails clearly and allows another turn', async (t) => {
+  const cases = [
+    { name: 'reasoning only', content: [{ type: 'reasoning', text: 'Thinking about the greeting.' }] },
+    { name: 'blank text', content: [{ type: 'text', text: ' \n\t' }] },
+    { name: 'ignored text', content: [{ type: 'text', text: 'Hidden', ignored: true }] },
+    { name: 'synthetic text', content: [{ type: 'text', text: 'Context', synthetic: true }] },
+    { name: 'no assistant message', content: undefined },
+  ]
+  for (const sample of cases) await t.test(sample.name, async (t) => {
+    const { provider, backend } = setup(t)
+    const id = await provider.create({ root: '/project' })
+    backend.history.get('ses_1').push({ info: { id: 'old_answer', role: 'assistant' }, parts: [{ id: 'old_text', type: 'text', text: 'Previous reply.' }] })
+    const emit = backend.emit.bind(backend)
+    backend.emit = (session, type, data) => {
+      if (data?.part?.type === 'text' || type === 'message.part.delta') return
+      emit(session, type, data)
+    }
+    const h = held(provider, id)
+    h.driver.send('Hi')
+    await until(() => backend.prompts.length === 1)
+    const prompt = backend.prompts[0]
+    const intermediate = { info: { id: 'intermediate', role: 'assistant' }, parts: [{ id: 'intermediate_text', type: 'text', text: 'Checking the task.' }] }
+    const final = v2Message({ id: prompt.info.id, type: 'assistant', content: sample.content ?? [] }, 'ses_1')
+    if (sample.content) backend.history.get('ses_1').push(intermediate, final)
+    for (const part of final.parts) emit('ses_1', 'message.part.updated', { part })
+    prompt.resolve(Response.json(final))
+    await until(() => h.signals().some((signal) => signal.kind === 'ended'))
+    assert.deepEqual(h.signals().filter((signal) => signal.kind === 'ended'), [{ kind: 'ended', how: 'failed', text: 'OpenCode finished without a final text reply. Try another model or send again.' }])
+    const saved = await provider.read('/project', id)
+    if (sample.name === 'reasoning only') {
+      assert.ok(h.items().some((item) => item.kind === 'thought' && item.text === final.parts[0].text))
+      assert.ok(saved.items.some((item) => item.kind === 'thought' && item.text === final.parts[0].text))
+    }
+    assert.equal(h.items().some((item) => item.kind === 'mine'), false)
+    h.driver.send('Reply again')
+    await until(() => backend.prompts.length === 2)
+    backend.complete(backend.prompts[1])
+    await until(() => h.signals().filter((signal) => signal.kind === 'ended').length === 2)
+    assert.equal(h.signals().findLast((signal) => signal.kind === 'ended').how, 'done')
+    await h.driver.end()
+  })
 })
 
 test('pure replay excludes synthetic/ignored user context and retains tools/errors', () => {

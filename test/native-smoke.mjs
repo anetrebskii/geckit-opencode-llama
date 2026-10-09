@@ -33,6 +33,11 @@ const server = createServer(async (request, response) => {
     const chunk = (delta, finish_reason = null) => ({ id: 'chatcmpl_test', object: 'chat.completion.chunk', created: 1, model: 'qwen-test', choices: [{ index: 0, delta, finish_reason }] })
     if (body.stream) {
       response.writeHead(200, { 'Content-Type': 'text/event-stream' })
+      if (JSON.stringify(body.messages.findLast((message) => message.role === 'user')).includes('reasoning-without-reply')) {
+        response.write(`data: ${JSON.stringify(chunk({ role: 'assistant', reasoning_content: 'Thinking about the greeting.' }))}\n\n`)
+        response.end(`data: ${JSON.stringify(chunk({}, 'stop'))}\n\ndata: [DONE]\n\n`)
+        return
+      }
       if (body.tools?.length && JSON.stringify(body.messages.findLast((message) => message.role === 'user')).includes('wait-for-stop')) {
         response.write(`data: ${JSON.stringify(chunk({ role: 'assistant', content: 'Waiting for Stop.' }))}\n\n`)
         stalledResponses.add(response)
@@ -123,6 +128,13 @@ try {
   assert.equal((await stopping).how, 'stopped')
   assert.equal((await turn('Continue after Stop.')).how, 'done')
   assert.equal(heard.flatMap((event) => event.signals).filter((signal) => signal.kind === 'ended').length, 3)
+  const incomplete = await turn('reasoning-without-reply')
+  assert.equal(incomplete.how, 'failed', JSON.stringify(incomplete))
+  assert.equal(incomplete.text, 'OpenCode finished without a final text reply. Try another model or send again.')
+  const incompleteHistory = await provider.read(project, id)
+  assert.ok(incompleteHistory.items.some((item) => item.kind === 'thought' && item.text === 'Thinking about the greeting.'))
+  assert.equal((await turn('Continue after the incomplete reply.')).how, 'done')
+  assert.equal(heard.flatMap((event) => event.signals).filter((signal) => signal.kind === 'ended').length, 5)
   await driver.end()
   const listed = await provider.list([project])
   assert.ok(listed.some((row) => row.id === id))
@@ -150,7 +162,7 @@ try {
   const corrected = await provider.correct('Correction fixture', 'Return corrected text', 'ollama/qwen-test')
   assert.equal(corrected.ok, true, JSON.stringify(corrected))
   assert.match(corrected.text, /Mock Ollama reply/)
-  const report = { version: (await provider.program()).version, models, completed: result, itemKinds: saved.items.map((item) => item.kind), mockRequests: requests, history: 'read/list/search/rename/fork/delete, permission, two question cards, Stop/continue, Plan denial, owned instructions and correction pass', root: base }
+  const report = { version: (await provider.program()).version, models, completed: result, incomplete, itemKinds: saved.items.map((item) => item.kind), mockRequests: requests, history: 'read/list/search/rename/fork/delete, permission, two question cards, Stop/continue, reasoning-only failure/recovery, Plan denial, owned instructions and correction pass', root: base }
   await writeFile(join(base, 'result.json'), JSON.stringify(report, null, 2))
   console.log(JSON.stringify(report, null, 2))
 } finally {

@@ -153,13 +153,16 @@ export function holdOpenCode(provider, options, hear, left) {
       if (active !== turn || disposed) return
       const saved = await transport.request(root, `/session/${id}/message`, 'GET', undefined, turn.controller.signal)
       if (active !== turn || disposed) return
+      const final = saved.findLast(({ info }) => info.role === 'assistant' && !sealedMessages.has(info.id))
+      const reply = final?.parts.some((part) => part.type === 'text' && !part.ignored && !part.synthetic && part.text?.trim())
       for (const { info, parts: finalParts } of saved) {
         if (sealedMessages.has(info.id)) continue
         updateInfo(info)
         sealedMessages.add(info.id)
         for (const part of finalParts) { updatePart(part); sealedParts.add(part.id) }
       }
-      finish(turn, result.info.error ? 'failed' : 'done', result.info.error ? errorText(result.info.error) : undefined)
+      const error = result.info.error ? errorText(result.info.error) : reply ? undefined : 'OpenCode finished without a final text reply. Try another model or send again.'
+      finish(turn, error ? 'failed' : 'done', error)
     } catch (error) { if (active === turn) fail(error) }
   }
   const stop = async () => {
