@@ -49,9 +49,13 @@ var OpenCodeTransport = class {
       child.stdout.on("data", (data) => {
         if (settled) return;
         output = (output + data.toString()).slice(-8192);
-        const found = /opencode server listening on (http:\/\/127\.0\.0\.1:\d+)/.exec(output);
+        const found = /(?:^|\n)(opencode )?server listening on (http:\/\/127\.0\.0\.1:\d+)/.exec(output);
         if (!found) return;
-        const url = new URL(found[1]);
+        if (!found[1]) {
+          fail(new Error("OpenCode 2.x is not supported by this library. Use OpenCode 1.x (tested with 1.18.35)."));
+          return;
+        }
+        const url = new URL(found[2]);
         if (url.port === "0") return;
         settled = true;
         clearTimeout(timer);

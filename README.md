@@ -4,7 +4,7 @@ Independent GeckIt assistant library for configured Llama models through OpenCod
 
 ## Setup
 
-Install [OpenCode](https://opencode.ai/docs/) and put `opencode` on the PATH visible to GeckIt. `GECKIT_OPENCODE_BIN` can select an absolute executable path. This library targets the current OpenCode v1 HTTP protocol; verification uses 1.18.35. Older releases may lack the current permission/question events.
+Install [OpenCode](https://opencode.ai/docs/) version **1.18.35** and put `opencode` on the PATH visible to GeckIt. `GECKIT_OPENCODE_BIN` can select an absolute executable path. This library supports OpenCode's v1 HTTP protocol; verification uses 1.18.35. **OpenCode 2.x is unsupported** because its server uses a different HTTP protocol. Older releases may lack the required permission/question events.
 
 For local Llama, install [Ollama](https://docs.ollama.com/), start its server, then pull a model:
 

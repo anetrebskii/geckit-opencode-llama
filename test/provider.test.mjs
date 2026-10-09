@@ -292,6 +292,24 @@ test('missing executable, startup timeout and disposal are bounded', async () =>
   await assert.rejects(hanging.start(), /disposed/)
 })
 
+test('OpenCode 2 startup banner reports incompatibility across output chunks and stops server', async () => {
+  let killed = false
+  const transport = new OpenCodeTransport({ startupMs: 100, launch: () => {
+    const child = new EventEmitter()
+    child.stdout = new PassThrough()
+    child.stderr = new PassThrough()
+    child.kill = () => { killed = true; return true }
+    queueMicrotask(() => {
+      child.stdout.write('server listening on http://127.0.')
+      child.stdout.write('0.1:54321\n')
+    })
+    return child
+  } })
+  try { await assert.rejects(transport.start(), /OpenCode 2\.x is not supported.*1\.18\.35/) }
+  finally { transport.dispose() }
+  assert.equal(killed, true)
+})
+
 test('session allowances stay in one conversation and use once at the native boundary', async (t) => {
   const { provider, backend } = setup(t)
   const first = held(provider, await provider.create({ root: '/project' }))
