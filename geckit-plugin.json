@@ -1,0 +1,19 @@
+{
+  "apiVersion": 1,
+  "entry": "index.mjs",
+  "provider": {
+    "id": "plugin:opencode-llama",
+    "family": "plugin:opencode-llama",
+    "name": "OpenCode (Llama)",
+    "shortName": "Llama",
+    "icon": "opencode-llama",
+    "iconPath": "M3 2h10v12H3z M6 5h4v6H6z",
+    "browser": "none",
+    "loginCommand": "opencode auth login",
+    "planName": "",
+    "resumeCommand": "opencode --session {id}",
+    "localOnly": true,
+    "instructions": "own",
+    "source": "https://github.com/anetrebskii/geckit-opencode-llama"
+  }
+}

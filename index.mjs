@@ -1,0 +1,723 @@
+// src/provider.mjs
+import { realpathSync } from "node:fs";
+import { homedir } from "node:os";
+import { resolve } from "node:path";
+
+// src/transport.mjs
+import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
+var OpenCodeTransport = class {
+  constructor({ executable = process.env.GECKIT_OPENCODE_BIN ?? "opencode", launch = spawn, fetcher = fetch, startupMs = 15e3 } = {}) {
+    this.executable = executable;
+    this.launch = launch;
+    this.fetcher = fetcher;
+    this.startupMs = startupMs;
+    this.disposed = false;
+    this.requests = /* @__PURE__ */ new Set();
+  }
+  start() {
+    if (this.disposed) return Promise.reject(new Error("OpenCode library has been disposed."));
+    if (this.starting) return this.starting;
+    this.password = randomBytes(24).toString("hex");
+    this.starting = new Promise((resolve2, reject) => {
+      const child = this.launch(this.executable, ["serve", "--hostname=127.0.0.1", "--port=0"], {
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+        env: { ...process.env, OPENCODE_SERVER_USERNAME: "geckit", OPENCODE_SERVER_PASSWORD: this.password }
+      });
+      this.child = child;
+      let output = "";
+      let settled = false;
+      const fail = (error) => {
+        clearTimeout(timer);
+        if (!settled) {
+          settled = true;
+          reject(error);
+        }
+        if (this.child === child) {
+          this.child = void 0;
+          this.starting = void 0;
+        }
+        for (const controller of this.requests) controller.abort(error);
+        child.kill();
+      };
+      const timer = setTimeout(() => fail(new Error("OpenCode server did not start within 15 seconds.")), this.startupMs);
+      child.once("error", (error) => fail(new Error(`Cannot start OpenCode: ${error.message}`)));
+      child.once("close", () => fail(new Error("OpenCode server exited.")));
+      child.stderr.on("data", () => {
+      });
+      child.stdout.on("data", (data) => {
+        if (settled) return;
+        output = (output + data.toString()).slice(-8192);
+        const found = /opencode server listening on (http:\/\/127\.0\.0\.1:\d+)/.exec(output);
+        if (!found) return;
+        const url = new URL(found[1]);
+        if (url.port === "0") return;
+        settled = true;
+        clearTimeout(timer);
+        resolve2(url.origin);
+      });
+    });
+    const pending = this.starting;
+    void pending.catch(() => {
+      if (this.starting === pending) this.starting = void 0;
+    });
+    return this.starting;
+  }
+  async response(root, path, method, body, signal, timeoutMs = 3e4) {
+    if (root?.startsWith("ssh://")) throw new Error("OpenCode (Llama) runs only on this computer.");
+    const base = await this.start();
+    if (signal?.aborted) throw signal.reason;
+    const url = new URL(path, base);
+    if (root) url.searchParams.set("directory", root);
+    const controller = new AbortController();
+    this.requests.add(controller);
+    const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+    const timer = timeoutMs > 0 ? setTimeout(() => controller.abort(new Error("OpenCode request timed out.")), timeoutMs) : void 0;
+    const release = () => {
+      clearTimeout(timer);
+      this.requests.delete(controller);
+    };
+    try {
+      const response = await this.fetcher(url, {
+        method,
+        signal: combined,
+        headers: { Authorization: `Basic ${Buffer.from(`geckit:${this.password}`).toString("base64")}`, "Content-Type": "application/json" },
+        ...body === void 0 ? {} : { body: JSON.stringify(body) }
+      });
+      if (!response.ok) {
+        const detail = (await response.text()).slice(0, 2e3);
+        throw Object.assign(new Error(`OpenCode ${method} ${url.pathname}: ${response.status} ${detail}`), { status: response.status });
+      }
+      return { response, release, controller };
+    } catch (error) {
+      release();
+      throw error;
+    }
+  }
+  async request(root, path, method = "GET", body, signal, timeoutMs) {
+    const { response, release } = await this.response(root, path, method, body, signal, timeoutMs);
+    try {
+      return response.status === 204 ? void 0 : await response.json();
+    } finally {
+      release();
+    }
+  }
+  async subscribe(root, hear, failed, signal) {
+    const { response, release, controller } = await this.response(root, "/event", "GET", void 0, signal);
+    if (!response.body) {
+      release();
+      throw new Error("OpenCode event stream is missing.");
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    const pump = async () => {
+      let buffer = "";
+      try {
+        for (; ; ) {
+          const { value, done: done2 } = await reader.read();
+          if (done2) throw new Error("OpenCode event stream disconnected.");
+          buffer += decoder.decode(value, { stream: true }).replace(/\r/g, "");
+          let at;
+          while ((at = buffer.indexOf("\n\n")) >= 0) {
+            const frame = buffer.slice(0, at);
+            buffer = buffer.slice(at + 2);
+            const data = frame.split("\n").filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trimStart()).join("\n");
+            if (data) hear(JSON.parse(data));
+          }
+          if (buffer.length > 4e6) throw new Error("OpenCode event frame is too large.");
+        }
+      } catch (error) {
+        if (!signal?.aborted && (!controller.signal.aborted || controller.signal.reason?.name !== "AbortError")) failed(error);
+      } finally {
+        release();
+        reader.releaseLock();
+      }
+    };
+    release();
+    this.requests.add(controller);
+    const done = pump().finally(() => this.requests.delete(controller));
+    return { close: async () => {
+      controller.abort();
+      await reader.cancel().catch(() => {
+      });
+      await done;
+    } };
+  }
+  dispose() {
+    this.disposed = true;
+    for (const controller of this.requests) controller.abort(new Error("OpenCode library disposed."));
+    this.child?.kill();
+  }
+};
+
+// src/transcript.mjs
+var family = "plugin:opencode-llama";
+var geckitId = (id) => `${family}:${id}`;
+function nativeId(id) {
+  if (typeof id !== "string" || !id.startsWith(`${family}:`) || !/^ses_[A-Za-z0-9]+$/.test(id.slice(family.length + 1))) throw new Error("Session does not belong to OpenCode (Llama).");
+  return id.slice(family.length + 1);
+}
+var errorText = (error) => error?.data?.message ?? error?.message ?? "OpenCode request failed.";
+var permissions = [
+  { permission: "*", pattern: "*", action: "ask" },
+  { permission: "question", pattern: "*", action: "allow" }
+];
+function catalog(data, defaultModel) {
+  const connected = new Set(data.connected ?? []);
+  return (data.all ?? []).filter((provider) => connected.has(provider.id)).flatMap((provider) => Object.entries(provider.models ?? {}).filter(([id, model]) => /llama/i.test(`${id} ${model.name ?? ""}`)).map(([id, model]) => {
+    const value = `${provider.id}/${id}`;
+    const cost = model.cost;
+    return {
+      value,
+      id: value,
+      name: model.name ?? id,
+      isDefault: value === defaultModel,
+      supportsAutoMode: false,
+      ...model.limit?.context > 0 ? { contextWindow: model.limit.context } : {},
+      ...model.limit?.output > 0 ? { maxOutputTokens: model.limit.output } : {},
+      ...cost ? { pricing: {
+        currency: "USD",
+        ...Number.isFinite(cost.input) ? { input: cost.input } : {},
+        ...Number.isFinite(cost.output) ? { output: cost.output } : {},
+        ...Number.isFinite(cost.cache_read) ? { cacheRead: cost.cache_read } : {},
+        ...Number.isFinite(cost.cache_write) ? { cacheWrite: cost.cache_write } : {}
+      } } : {}
+    };
+  }));
+}
+function partItem(part, info) {
+  if (!info || part.ignored || part.synthetic) return void 0;
+  const at = info.time?.created;
+  if (part.type === "text") return { kind: info.role === "user" ? "mine" : "theirs", id: part.id, text: part.text ?? "", ...at === void 0 ? {} : { at } };
+  if (info.role !== "assistant") return void 0;
+  if (part.type === "reasoning") return { kind: "thought", id: part.id, text: part.text ?? "" };
+  if (part.type !== "tool") return void 0;
+  const state = part.state ?? {};
+  return {
+    kind: "did",
+    id: part.id,
+    what: state.title ?? part.tool,
+    detail: state.output ?? state.error ?? JSON.stringify(state.input ?? {}),
+    live: state.status === "pending" || state.status === "running"
+  };
+}
+function spend(info, window) {
+  const tokens = info.tokens;
+  return {
+    ...tokens ? { used: (tokens.input ?? 0) + (tokens.output ?? 0) + (tokens.reasoning ?? 0) + (tokens.cache?.read ?? 0) + (tokens.cache?.write ?? 0) } : {},
+    ...window === void 0 ? {} : { window },
+    ...Number.isFinite(info.cost) ? { cost: info.cost, currency: "USD", costKind: "api-equivalent" } : {}
+  };
+}
+function conversation(messages, window) {
+  const items = messages.flatMap(({ info, parts }) => parts.map((part) => partItem(part, info)).filter(Boolean));
+  const assistants = messages.map(({ info }) => info).filter((info) => info.role === "assistant");
+  const last = assistants.at(-1);
+  return {
+    items,
+    tasks: [],
+    ...window === void 0 ? {} : { window },
+    ...assistants.some((info) => Number.isFinite(info.cost)) ? { cost: assistants.reduce((sum, info) => sum + (info.cost ?? 0), 0), currency: "USD", costKind: "api-equivalent" } : {},
+    ...last === void 0 ? {} : { used: spend(last).used }
+  };
+}
+function linksIn(items) {
+  const found = /* @__PURE__ */ new Map();
+  for (const item of [...items].reverse()) {
+    if (item.kind !== "mine" && item.kind !== "theirs") continue;
+    for (const match of item.text.matchAll(/https?:\/\/[^\s<>"'`)\]]+/g)) {
+      const url = match[0].replace(/[.,;:!?]+$/, "");
+      if (!found.has(url)) found.set(url, { url });
+    }
+  }
+  return [...found.values()];
+}
+
+// src/driver.mjs
+function holdOpenCode(provider, options, hear, left) {
+  const id = nativeId(options.id);
+  const { transport } = provider;
+  const root = options.root;
+  const messages = /* @__PURE__ */ new Map();
+  const parts = /* @__PURE__ */ new Map();
+  const sealedMessages = /* @__PURE__ */ new Set();
+  const sealedParts = /* @__PURE__ */ new Set();
+  const requests = /* @__PURE__ */ new Map();
+  const grants = provider.grants.get(id) ?? [];
+  provider.grants.set(id, grants);
+  let disposed = false;
+  let active;
+  let stream;
+  let mode = options.mode === "plan" ? "plan" : "manual";
+  let cost = 0;
+  let measuredCost = false;
+  let stopping = Promise.resolve();
+  let appliedMode;
+  let capacity;
+  let ready;
+  let ending;
+  const emit = (items = [], signals = [], gone = []) => hear({ items, signals, gone });
+  const finish = (turn, how, text) => {
+    if (active !== turn) return;
+    active = void 0;
+    for (const ask of [...requests.keys()]) resolveRequest(ask, how === "stopped" ? "Stopped" : "Turn ended");
+    emit([], [{ kind: "ended", how, ...text === void 0 ? {} : { text } }]);
+  };
+  const fail = (error) => {
+    if (!active) return;
+    const turn = active;
+    turn.controller.abort(error);
+    stopping = Promise.resolve().then(async () => {
+      await ready?.catch(() => {
+      });
+      if (turn.prompted) await transport.request(root, `/session/${id}/abort`, "POST").catch(() => {
+      });
+    });
+    finish(turn, "failed", errorText(error));
+  };
+  const updateInfo = (info) => {
+    const previous = messages.get(info.id);
+    messages.set(info.id, info);
+    if (info.role === "assistant" && active) {
+      if (Number.isFinite(info.cost)) {
+        measuredCost = true;
+        cost += info.cost - (previous?.cost ?? 0);
+      }
+      emit([], [{ kind: "spend", ...spend(info, capacity), ...measuredCost ? { cost, currency: "USD", costKind: "api-equivalent" } : {} }]);
+    }
+    emit([...parts.values()].filter((part) => part.messageID === info.id).map((part) => partItem(part, info)).filter(Boolean));
+  };
+  const updatePart = (part) => {
+    parts.set(part.id, part);
+    const item = partItem(part, messages.get(part.messageID));
+    if (item) emit([item], item.kind === "did" && item.live ? [{ kind: "doing", what: item.what }] : []);
+  };
+  const card = (ask, wanted, shown) => {
+    emit([{ kind: "card", id: `card:${ask}`, card: shown }], [{ kind: "asks", ask, wanted }]);
+  };
+  const resolveRequest = (requestID, answer) => {
+    const request = requests.get(requestID);
+    if (!request) return;
+    const asks = request.kind === "question" ? request.questions.map((_, index) => index === 0 ? requestID : `${requestID}#${index}`) : [requestID];
+    for (const ask of asks) {
+      const shown = request.cards.get(ask);
+      emit(shown ? [{ kind: "card", id: `card:${ask}`, card: { ...shown, answered: answer } }] : [], [{ kind: "resolved", ask }]);
+    }
+    requests.delete(requestID);
+  };
+  const event = ({ type, properties: p = {} }) => {
+    const session = p.sessionID ?? p.info?.sessionID ?? p.part?.sessionID;
+    if (session !== id) return;
+    if (type === "message.updated" && !sealedMessages.has(p.info.id)) updateInfo(p.info);
+    if (type === "message.part.updated" && !sealedParts.has(p.part.id)) updatePart(p.part);
+    if (type === "message.part.delta") {
+      const part = parts.get(p.partID);
+      if (part && !sealedParts.has(p.partID) && p.field === "text") updatePart({ ...part, text: (part.text ?? "") + p.delta });
+    }
+    if (type === "message.part.removed") {
+      parts.delete(p.partID);
+      emit([], [], [p.partID]);
+    }
+    if (type === "message.removed") {
+      const gone = [...parts.values()].filter((part) => part.messageID === p.messageID).map((part) => part.id);
+      for (const part of gone) parts.delete(part);
+      messages.delete(p.messageID);
+      emit([], [], gone);
+    }
+    if (type === "permission.asked" && active && !requests.has(p.id)) {
+      if (grants.some((grant) => grant.permission === p.permission && p.patterns.every((pattern) => grant.patterns.includes(pattern)))) {
+        void transport.request(root, `/permission/${encodeURIComponent(p.id)}/reply`, "POST", { reply: "once" }).catch(fail);
+        return;
+      }
+      const detail = (p.patterns ?? []).join("\n");
+      const shown = { kind: "permission", title: `Allow ${p.permission}?`, detail };
+      requests.set(p.id, { kind: "permission", permission: p.permission, patterns: p.patterns, cards: /* @__PURE__ */ new Map([[p.id, shown]]) });
+      card(p.id, { kind: "other", tool: p.permission, detail }, shown);
+    }
+    if (type === "question.asked" && active && !requests.has(p.id)) {
+      const cards = /* @__PURE__ */ new Map();
+      requests.set(p.id, { kind: "question", questions: p.questions, answers: [], cards });
+      p.questions.forEach((question, index) => {
+        const ask = index === 0 ? p.id : `${p.id}#${index}`;
+        const choices = question.options.map((option) => option.label);
+        const shown = { kind: "question", title: question.question, choices };
+        cards.set(ask, shown);
+        card(ask, { kind: "question", question: question.question, choices }, shown);
+      });
+    }
+    if (type === "permission.replied") resolveRequest(p.requestID, requests.get(p.requestID)?.answerLabel ?? (p.reply === "reject" ? "Declined" : "Allowed once"));
+    if (type === "question.replied" || type === "question.rejected") resolveRequest(p.requestID, type === "question.rejected" ? "Declined" : "Answered");
+    if (type === "session.status" && p.status?.type === "retry") emit([], [{ kind: "doing", what: p.status.message }]);
+  };
+  const prepare = async () => {
+    await provider.session(root, options.id);
+    const history = await transport.request(root, `/session/${id}/message`);
+    for (const { info, parts: saved } of history) {
+      messages.set(info.id, info);
+      sealedMessages.add(info.id);
+      for (const part of saved) {
+        parts.set(part.id, part);
+        sealedParts.add(part.id);
+      }
+    }
+    stream = await transport.subscribe(root, event, (error) => {
+      ready = void 0;
+      stream = void 0;
+      fail(error);
+    });
+    if (disposed) await stream.close();
+  };
+  const run = async (turn, text, images, before) => {
+    try {
+      await stopping;
+      if (active !== turn || disposed) return;
+      if (images?.length) throw new Error("OpenCode (Llama) accepts text only.");
+      ready ??= prepare().catch((error) => {
+        ready = void 0;
+        throw error;
+      });
+      await ready;
+      if (active !== turn || disposed) return;
+      const model = await provider.chooseModel(root, options.model);
+      if (active !== turn || disposed) return;
+      capacity = model.contextWindow;
+      const slash = model.value.indexOf("/");
+      const rules = mode === "plan" ? [...permissions, ...["edit", "write", "apply_patch", "bash"].map((permission) => ({ permission, pattern: "*", action: "deny" }))] : permissions;
+      if (appliedMode !== mode) {
+        await transport.request(root, `/session/${id}`, "PATCH", { permission: rules }, turn.controller.signal);
+        appliedMode = mode;
+      }
+      if (active !== turn || disposed) return;
+      emit([], [{ kind: "started", session: geckitId(id), model: model.value, key: false, mode }]);
+      turn.prompted = true;
+      const result = await transport.request(root, `/session/${id}/message`, "POST", {
+        model: { providerID: model.value.slice(0, slash), modelID: model.value.slice(slash + 1) },
+        agent: mode === "plan" ? "plan" : "build",
+        ...provider.instructions ? { system: provider.instructions } : {},
+        parts: [{ type: "text", text: [...before ?? [], text].join("\n\n") }]
+      }, turn.controller.signal, 0);
+      if (active !== turn || disposed) return;
+      const saved = await transport.request(root, `/session/${id}/message`, "GET", void 0, turn.controller.signal);
+      if (active !== turn || disposed) return;
+      for (const { info, parts: finalParts } of saved) {
+        if (sealedMessages.has(info.id)) continue;
+        updateInfo(info);
+        sealedMessages.add(info.id);
+        for (const part of finalParts) {
+          updatePart(part);
+          sealedParts.add(part.id);
+        }
+      }
+      finish(turn, result.info.error ? "failed" : "done", result.info.error ? errorText(result.info.error) : void 0);
+    } catch (error) {
+      if (active === turn) fail(error);
+    }
+  };
+  const stop = async () => {
+    const turn = active;
+    if (!turn) return;
+    turn.controller.abort();
+    stopping = Promise.resolve().then(async () => {
+      await ready?.catch(() => {
+      });
+      if (disposed && !stream) return;
+      await transport.request(root, `/session/${id}/abort`, "POST").catch(() => {
+      });
+    });
+    finish(turn, "stopped");
+    await stopping;
+  };
+  const driver = {
+    send(text, images, before) {
+      if (disposed) throw new Error("OpenCode driver has ended.");
+      if (active) throw new Error("OpenCode is already answering this conversation.");
+      const turn = { controller: new AbortController() };
+      active = turn;
+      turn.done = run(turn, text, images, before);
+    },
+    answer(ask, answer) {
+      const split = ask.lastIndexOf("#");
+      const requestID = split < 0 ? ask : ask.slice(0, split);
+      const request = requests.get(requestID);
+      if (!request) return;
+      const turn = active;
+      void (async () => {
+        if (request.kind === "permission") {
+          const reply = answer === "once" || answer === "session" ? "once" : "reject";
+          request.answerLabel = answer === "session" ? "Allowed for session" : reply === "reject" ? "Declined" : "Allowed once";
+          await transport.request(root, `/permission/${encodeURIComponent(requestID)}/reply`, "POST", { reply });
+          if (answer === "session") grants.push({ permission: request.permission, patterns: request.patterns });
+          resolveRequest(requestID, request.answerLabel);
+        } else {
+          const index = split < 0 ? 0 : Number(ask.slice(split + 1));
+          const question = request.questions[index];
+          if (!question) return;
+          if (question.custom === false && !question.options.some((option) => option.label === answer)) throw new Error("Choose one of the answers OpenCode offered.");
+          request.answers[index] = [String(answer)];
+          if (!request.questions.every((_, i) => request.answers[i] !== void 0)) return;
+          await transport.request(root, `/question/${encodeURIComponent(requestID)}/reply`, "POST", { answers: request.answers });
+          resolveRequest(requestID, "Answered");
+        }
+      })().catch((error) => {
+        if (active === turn) fail(error);
+      });
+    },
+    permit(_mode, again) {
+      mode = "manual";
+      emit([], [{ kind: "mode", mode }]);
+      for (const ask of again) driver.answer(ask, "once");
+    },
+    stop() {
+      void stop();
+    },
+    end() {
+      ending ??= (async () => {
+        disposed = true;
+        await stop();
+        await stopping;
+        await ready?.catch(() => {
+        });
+        await stream?.close();
+        provider.drivers.delete(driver);
+        left();
+      })();
+      return ending;
+    }
+  };
+  provider.drivers.add(driver);
+  return driver;
+}
+
+// src/provider.mjs
+var noModel = "No configured Llama model. Configure Ollama or another Llama provider in OpenCode.";
+var local = (root) => {
+  if (root.startsWith("ssh://")) throw new Error("OpenCode (Llama) runs only on this computer.");
+  try {
+    return realpathSync(resolve(root));
+  } catch {
+    return resolve(root);
+  }
+};
+function create(_host, { transport = new OpenCodeTransport() } = {}) {
+  const roots = /* @__PURE__ */ new Map();
+  const windows = /* @__PURE__ */ new Map();
+  const state = {
+    transport,
+    drivers: /* @__PURE__ */ new Set(),
+    grants: /* @__PURE__ */ new Map(),
+    instructions: void 0,
+    async session(root, id) {
+      const native = nativeId(id);
+      const saved = await transport.request(root, `/session/${native}`);
+      if (local(saved.directory) !== local(root)) throw new Error("OpenCode conversation belongs to another folder.");
+      roots.set(id, local(root));
+      return saved;
+    },
+    async chooseModel(root, value) {
+      const models = await provider.models(root);
+      const model = value ? models.find((model2) => model2.value === value) : models.find((model2) => model2.isDefault) ?? models[0];
+      if (!model) throw new Error(value ? `Llama model is not configured: ${value}` : noModel);
+      return model;
+    }
+  };
+  const rootFor = async (id) => {
+    nativeId(id);
+    const root = roots.get(id);
+    if (root) return root;
+    const saved = await transport.request(void 0, `/session/${nativeId(id)}`);
+    roots.set(id, local(saved.directory));
+    return saved.directory;
+  };
+  const missing = (error) => error.status === 404;
+  const provider = {
+    id: family,
+    family,
+    name: "OpenCode (Llama)",
+    shortName: "Llama",
+    icon: "opencode-llama",
+    browser: "none",
+    loginCommand: "opencode auth login",
+    planName: "",
+    localOnly: true,
+    available: true,
+    subscriptionOnly: false,
+    images: false,
+    remoteControl: false,
+    nativeGoals: false,
+    idleMs: 10 * 6e4,
+    waitForExit: true,
+    async account() {
+      try {
+        return { provider: family, here: true, signedIn: true, program: await provider.program() };
+      } catch {
+        return { provider: family, here: false, signedIn: void 0 };
+      }
+    },
+    async program() {
+      const health = await transport.request(void 0, "/global/health");
+      return { version: health.version, path: transport.executable };
+    },
+    async models(root) {
+      if (root?.startsWith("ssh://")) return [];
+      const [data, config] = await Promise.all([transport.request(root, "/provider"), transport.request(root, "/config")]);
+      const models = catalog(data, config.model);
+      if (models.length && !models.some((model) => model.isDefault)) models[0].isDefault = true;
+      for (const model of models) if (model.contextWindow !== void 0) windows.set(model.value, model.contextWindow);
+      return models;
+    },
+    async limits(models) {
+      return { windows: new Map(models.map((id) => [id, windows.get(id)])) };
+    },
+    async create({ root, model }) {
+      local(root);
+      await state.chooseModel(root, model);
+      const session = await transport.request(root, "/session", "POST", { permission: permissions });
+      const id = geckitId(session.id);
+      nativeId(id);
+      roots.set(id, local(root));
+      return id;
+    },
+    async list(askedRoots) {
+      const rows = [];
+      const folders = /* @__PURE__ */ new Map();
+      for (const root of askedRoots.filter((root2) => !root2.startsWith("ssh://"))) {
+        const folder = local(root);
+        if (!folders.has(folder)) folders.set(folder, root);
+      }
+      for (const [folder, root] of folders) {
+        const saved = await transport.request(root, "/session");
+        for (const session of saved) {
+          if (local(session.directory) !== folder || session.time?.archived) continue;
+          const id = geckitId(session.id);
+          nativeId(id);
+          roots.set(id, root);
+          rows.push({ id, root, title: session.title ?? "OpenCode conversation", stands: "", at: session.time.updated, created: session.time.created, driven: false });
+        }
+      }
+      return rows;
+    },
+    async search(askedRoots, asked) {
+      if (!asked.trim()) return [];
+      const found = [];
+      const needle = asked.toLocaleLowerCase();
+      for (const row of await provider.list(askedRoots)) {
+        const saved = await provider.read(row.root, row.id);
+        const matches = (saved?.items ?? []).filter((item) => (item.kind === "mine" || item.kind === "theirs") && item.text.toLocaleLowerCase().includes(needle));
+        if (matches.length) {
+          const text = matches.at(-1).text;
+          const start = Math.max(0, text.toLocaleLowerCase().indexOf(needle) - 80);
+          found.push({ id: row.id, root: row.root, count: matches.length, said: text.slice(start, start + 240) });
+        }
+      }
+      return found;
+    },
+    hidden: async () => [],
+    async has(root, id) {
+      try {
+        await state.session(root, id);
+        return true;
+      } catch (error) {
+        if (missing(error)) return false;
+        throw error;
+      }
+    },
+    async read(root, id) {
+      try {
+        await state.session(root, id);
+        const messages = await transport.request(root, `/session/${nativeId(id)}/message`);
+        const last = messages.findLast(({ info }) => info.role === "assistant")?.info;
+        const model = last ? `${last.providerID}/${last.modelID}` : void 0;
+        return conversation(messages, windows.get(model));
+      } catch (error) {
+        if (missing(error)) return void 0;
+        throw error;
+      }
+    },
+    links: async (root, id) => linksIn((await provider.read(root, id))?.items ?? []),
+    async fork(root, id, at, _mode, model) {
+      await state.session(root, id);
+      await state.chooseModel(root, model);
+      const messages = await transport.request(root, `/session/${nativeId(id)}/message`);
+      const after = messages.find(({ info }) => info.time.created > at)?.info.id;
+      const saved = await transport.request(root, `/session/${nativeId(id)}/fork`, "POST", after ? { messageID: after } : {});
+      const fork = geckitId(saved.id);
+      nativeId(fork);
+      roots.set(fork, local(root));
+      return { id: fork, begun: true, items: (await provider.read(root, fork))?.items ?? [] };
+    },
+    hold(options, hear, left) {
+      local(options.root);
+      return holdOpenCode(state, options, hear, left);
+    },
+    async rename(id, title) {
+      await transport.request(await rootFor(id), `/session/${nativeId(id)}`, "PATCH", { title });
+    },
+    async delete(root, id) {
+      try {
+        await state.session(root, id);
+        const result = await transport.request(root, `/session/${nativeId(id)}`, "DELETE");
+        roots.delete(id);
+        return result === true;
+      } catch (error) {
+        if (missing(error)) return false;
+        throw error;
+      }
+    },
+    goal: async () => void 0,
+    setGoal: async () => void 0,
+    clearGoal: async () => {
+    },
+    remote: async () => {
+      throw new Error("OpenCode (Llama) does not support remote control.");
+    },
+    browsers: async () => void 0,
+    async mcp(root, change) {
+      if (change) await transport.request(root, `/mcp/${encodeURIComponent(change.name)}/${change.enabled ? "connect" : "disconnect"}`, "POST");
+      const servers = await transport.request(root, "/mcp");
+      return Object.entries(servers).map(([name, value]) => ({ name, status: value.status }));
+    },
+    async correct(text, instruction, model) {
+      const root = homedir();
+      let id;
+      try {
+        const selected = await state.chooseModel(root, model || void 0);
+        const slash = selected.value.indexOf("/");
+        const session = await transport.request(root, "/session", "POST", { title: "GeckIt correction", permission: [{ permission: "*", pattern: "*", action: "deny" }] });
+        id = session.id;
+        const result = await transport.request(root, `/session/${id}/message`, "POST", {
+          model: { providerID: selected.value.slice(0, slash), modelID: selected.value.slice(slash + 1) },
+          system: "Return only the requested text. Do not use tools.",
+          tools: { "*": false },
+          parts: [{ type: "text", text: `${instruction}
+
+${text}` }]
+        }, void 0, 9e4);
+        if (result.info.error) return { ok: false, error: errorText(result.info.error) };
+        const answer = result.parts.filter((part) => part.type === "text" && !part.ignored && !part.synthetic).map((part) => part.text).join("\n").trim();
+        return answer ? { ok: true, text: answer } : { ok: false, error: "OpenCode returned no correction." };
+      } catch (error) {
+        return { ok: false, error: errorText(error) };
+      } finally {
+        if (id) {
+          await transport.request(root, `/session/${id}/abort`, "POST").catch(() => {
+          });
+          await transport.request(root, `/session/${id}`, "DELETE").catch(() => {
+          });
+        }
+      }
+    },
+    async setInstructions(enabled) {
+      const command = process.env.GECKIT_SOURCE_CLI ?? `${homedir()}/.geckit/bin/geckit`;
+      state.instructions = enabled ? `This conversation is running in GeckIt. Use ${command} for board and conversation operations; run ${command} instructions app to read app guidance. Follow project AGENTS.md instructions. Never fabricate session links or claim unsupported native goals.` : void 0;
+    },
+    dispose() {
+      for (const driver of state.drivers) void driver.end();
+      transport.dispose();
+    }
+  };
+  return provider;
+}
+export {
+  create
+};
