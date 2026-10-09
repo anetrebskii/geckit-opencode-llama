@@ -17,3 +17,17 @@ jobs:
       - run: npm run build
       - run: git diff --exit-code -- index.mjs
       - run: npm test
+  native:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        opencode: ['1.18.35', '2.0.25']
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm install --prefix "$RUNNER_TEMP/opencode-runtime" --no-audit --no-fund "opencode-ai@${{ matrix.opencode }}"
+      - run: GECKIT_OPENCODE_BIN="$RUNNER_TEMP/opencode-runtime/node_modules/.bin/opencode" npm run test:native

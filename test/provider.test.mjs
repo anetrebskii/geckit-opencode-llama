@@ -292,7 +292,7 @@ test('missing executable, startup timeout and disposal are bounded', async () =>
   await assert.rejects(hanging.start(), /disposed/)
 })
 
-test('OpenCode 2 startup banner reports incompatibility across output chunks and stops server', async () => {
+test('OpenCode 2 startup banner selects its native adapter across output chunks', async () => {
   let killed = false
   const transport = new OpenCodeTransport({ startupMs: 100, launch: () => {
     const child = new EventEmitter()
@@ -305,7 +305,10 @@ test('OpenCode 2 startup banner reports incompatibility across output chunks and
     })
     return child
   } })
-  try { await assert.rejects(transport.start(), /OpenCode 2\.x is not supported.*1\.18\.35/) }
+  try {
+    assert.equal(await transport.start(), 'http://127.0.0.1:54321')
+    assert.equal(transport.protocol, 2)
+  }
   finally { transport.dispose() }
   assert.equal(killed, true)
 })

@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
+import { OpenCodeV2 } from './v2.mjs'
 
 export class OpenCodeTransport {
   constructor({ executable = process.env.GECKIT_OPENCODE_BIN ?? 'opencode', launch = spawn, fetcher = fetch, startupMs = 15_000 } = {}) {
@@ -9,6 +10,7 @@ export class OpenCodeTransport {
     this.startupMs = startupMs
     this.disposed = false
     this.requests = new Set()
+    this.v2 = new OpenCodeV2(this)
   }
 
   start() {
@@ -18,7 +20,7 @@ export class OpenCodeTransport {
     this.starting = new Promise((resolve, reject) => {
       const child = this.launch(this.executable, ['serve', '--hostname=127.0.0.1', '--port=0'], {
         stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
-        env: { ...process.env, OPENCODE_SERVER_USERNAME: 'geckit', OPENCODE_SERVER_PASSWORD: this.password },
+        env: { ...process.env, OPENCODE_SERVER_USERNAME: 'geckit', OPENCODE_SERVER_PASSWORD: this.password, OPENCODE_PASSWORD: this.password },
       })
       this.child = child
       let output = ''
@@ -39,10 +41,7 @@ export class OpenCodeTransport {
         output = (output + data.toString()).slice(-8192)
         const found = /(?:^|\n)(opencode )?server listening on (http:\/\/127\.0\.0\.1:\d+)/.exec(output)
         if (!found) return
-        if (!found[1]) {
-          fail(new Error('OpenCode 2.x is not supported by this library. Use OpenCode 1.x (tested with 1.18.35).'))
-          return
-        }
+        this.protocol = found[1] ? 1 : 2
         const url = new URL(found[2])
         if (url.port === '0') return
         settled = true
@@ -60,7 +59,7 @@ export class OpenCodeTransport {
     const base = await this.start()
     if (signal?.aborted) throw signal.reason
     const url = new URL(path, base)
-    if (root) url.searchParams.set('directory', root)
+    if (root) url.searchParams.set(this.protocol === 2 && url.pathname !== '/api/session' ? 'location[directory]' : 'directory', root)
     const controller = new AbortController()
     this.requests.add(controller)
     const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal
@@ -69,7 +68,7 @@ export class OpenCodeTransport {
     try {
       const response = await this.fetcher(url, {
         method, signal: combined,
-        headers: { Authorization: `Basic ${Buffer.from(`geckit:${this.password}`).toString('base64')}`, 'Content-Type': 'application/json' },
+        headers: { Authorization: `Basic ${Buffer.from(`${this.protocol === 2 ? 'opencode' : 'geckit'}:${this.password}`).toString('base64')}`, 'Content-Type': 'application/json' },
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       })
       if (!response.ok) {
@@ -81,13 +80,23 @@ export class OpenCodeTransport {
   }
 
   async request(root, path, method = 'GET', body, signal, timeoutMs) {
+    await this.start()
+    return this.protocol === 2 ? this.v2.request(root, path, method, body, signal, timeoutMs) : this.rawRequest(root, path, method, body, signal, timeoutMs)
+  }
+
+  async rawRequest(root, path, method = 'GET', body, signal, timeoutMs) {
     const { response, release } = await this.response(root, path, method, body, signal, timeoutMs)
     try { return response.status === 204 ? undefined : await response.json() }
     finally { release() }
   }
 
-  async subscribe(root, hear, failed, signal) {
-    const { response, release, controller } = await this.response(root, '/event', 'GET', undefined, signal)
+  async subscribe(root, hear, failed, signal, sessionID) {
+    await this.start()
+    return this.protocol === 2 ? this.v2.subscribe(root, hear, failed, signal, sessionID) : this.subscribeAt(root, '/event', hear, failed, signal)
+  }
+
+  async subscribeAt(root, path, hear, failed, signal) {
+    const { response, release, controller } = await this.response(root, path, 'GET', undefined, signal)
     if (!response.body) { release(); throw new Error('OpenCode event stream is missing.') }
     const reader = response.body.getReader()
     const decoder = new TextDecoder()

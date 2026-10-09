@@ -6,6 +6,270 @@ import { resolve } from "node:path";
 // src/transport.mjs
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
+
+// src/v2-transcript.mjs
+var v2Rules = (rules) => rules.map((rule) => ({ action: rule.permission === "bash" ? "shell" : rule.permission, resource: rule.pattern, effect: rule.action }));
+var v2Session = (session) => ({ ...session, directory: session.location.directory });
+function v2Message(message, sessionID) {
+  const role = message.type === "user" ? "user" : message.type === "assistant" ? "assistant" : void 0;
+  const info = {
+    ...message,
+    sessionID,
+    role,
+    providerID: message.model?.providerID,
+    modelID: message.model?.id
+  };
+  if (!role) return { info, parts: [] };
+  if (role === "user") return { info, parts: [{ id: `${message.id}:text:0`, sessionID, messageID: message.id, type: "text", text: message.text }] };
+  const ordinals = { text: 0, reasoning: 0 };
+  const parts = message.content.map((content) => {
+    const base = { sessionID, messageID: message.id, type: content.type };
+    if (content.type !== "tool") return { ...content, ...base, id: `${message.id}:${content.type}:${ordinals[content.type]++}` };
+    return {
+      ...base,
+      id: `${message.id}:tool:${content.id}`,
+      tool: content.name,
+      state: {
+        ...content.state,
+        status: content.state.status === "streaming" ? "pending" : content.state.status,
+        title: content.state.metadata?.title,
+        output: content.state.content?.filter((item) => item.type === "text").map((item) => item.text).join("\n"),
+        error: content.state.error?.message
+      }
+    };
+  });
+  return { info, parts };
+}
+function v2Catalog(providers, models) {
+  return {
+    connected: providers.map((provider) => provider.id),
+    all: providers.map((provider) => ({
+      ...provider,
+      models: Object.fromEntries(models.filter((model) => model.providerID === provider.id && model.enabled).map((model) => {
+        const cost = model.cost.find((tier) => !tier.tier);
+        return [model.id, {
+          ...model,
+          cost: cost && { input: cost.input, output: cost.output, cache_read: cost.cache.read, cache_write: cost.cache.write }
+        }];
+      }))
+    }))
+  };
+}
+function v2Question(form) {
+  const supported = form.metadata?.kind === "question" && form.fields.every((field) => (field.type === "string" || field.type === "multiselect") && !field.when?.length && !field.hidden);
+  return {
+    id: form.id,
+    sessionID: form.sessionID,
+    ...supported ? {} : { error: "This OpenCode form cannot be answered in GeckIt. Use a question with text or choices." },
+    questions: supported ? form.fields.map((field) => ({
+      question: field.description ?? field.title ?? form.title,
+      options: (field.options ?? []).map((option) => ({ label: option.label, description: option.description })),
+      custom: field.custom !== false
+    })) : []
+  };
+}
+
+// src/v2-events.mjs
+function v2Events(hear, requests, forms, failures, ownedSession) {
+  const messages = /* @__PURE__ */ new Map();
+  const parts = /* @__PURE__ */ new Map();
+  const emit = (type, properties) => hear({ type, properties });
+  const updatePart = (part) => {
+    parts.set(part.id, part);
+    emit("message.part.updated", { part });
+  };
+  return (event) => {
+    const p = event.data;
+    if (!p) return;
+    const sessionID = p.sessionID ?? p.form?.sessionID;
+    if (ownedSession && sessionID !== ownedSession) return;
+    if (event.type === "session.execution.started") failures.delete(sessionID);
+    if (event.type === "session.execution.failed") failures.set(sessionID, p.error);
+    if (event.type === "permission.asked") {
+      requests.set(p.id, p.sessionID);
+      emit("permission.asked", { ...p, permission: p.action, patterns: p.resources });
+    }
+    if (event.type === "permission.replied") {
+      requests.delete(p.requestID);
+      emit(event.type, p);
+    }
+    if (event.type === "form.created") {
+      forms.set(p.form.id, p.form);
+      emit("question.asked", v2Question(p.form));
+    }
+    if (event.type === "form.replied" || event.type === "form.cancelled") {
+      forms.delete(p.id);
+      emit(event.type === "form.replied" ? "question.replied" : "question.rejected", { ...p, requestID: p.id });
+    }
+    const messageID = p.assistantMessageID;
+    if (event.type === "session.step.started") {
+      const info = { id: messageID, sessionID, role: "assistant", providerID: p.model.providerID, modelID: p.model.id, time: { created: p.started } };
+      messages.set(messageID, info);
+      emit("message.updated", { info });
+    }
+    if (event.type === "session.step.ended" || event.type === "session.step.failed") {
+      const info = { ...messages.get(messageID), id: messageID, sessionID, role: "assistant", cost: p.cost, tokens: p.tokens, error: p.error };
+      messages.set(messageID, info);
+      emit("message.updated", { info });
+    }
+    const fragment = /^session\.(text|reasoning)\.(started|delta|ended)$/.exec(event.type);
+    if (fragment) {
+      const [, type, phase] = fragment;
+      const id = `${messageID}:${type}:${p.ordinal}`;
+      const previous = parts.get(id);
+      updatePart({ id, sessionID, messageID, type, text: phase === "delta" ? (previous?.text ?? "") + p.delta : p.text ?? "" });
+    }
+    if (event.type.startsWith("session.tool.")) {
+      const id = `${messageID}:tool:${p.id}`;
+      const previous = parts.get(id);
+      const base = { id, sessionID, messageID, type: "tool", tool: p.name ?? previous?.tool };
+      const state = previous?.state ?? { status: "pending", input: "" };
+      if (event.type === "session.tool.input.started") updatePart({ ...base, state });
+      if (event.type === "session.tool.input.delta") updatePart({ ...base, state: { ...state, input: state.input + p.delta } });
+      if (event.type === "session.tool.input.ended") updatePart({ ...base, state: { ...state, input: p.text } });
+      if (event.type === "session.tool.called") updatePart({ ...base, state: { status: "running", input: p.input } });
+      if (event.type === "session.tool.progress") updatePart({ ...base, state: { ...state, title: p.metadata.title } });
+      if (event.type === "session.tool.success" || event.type === "session.tool.failed") updatePart({
+        ...base,
+        state: {
+          ...state,
+          status: p.error ? "error" : "completed",
+          error: p.error?.message,
+          output: p.content?.filter((item) => item.type === "text").map((item) => item.text).join("\n")
+        }
+      });
+    }
+    if (event.type === "session.retry.scheduled") emit("session.status", { sessionID, status: { type: "retry", message: p.error.message } });
+    if (event.type.startsWith("session.execution.") && event.type !== "session.execution.started") {
+      for (const [id, info] of messages) if (info.sessionID === sessionID) messages.delete(id);
+      for (const [id, part] of parts) if (part.sessionID === sessionID) parts.delete(id);
+      for (const [id, owner] of requests) if (owner === sessionID) requests.delete(id);
+      for (const [id, form] of forms) if (form.sessionID === sessionID) forms.delete(id);
+    }
+  };
+}
+
+// src/v2.mjs
+import { setTimeout as delay } from "node:timers/promises";
+var OpenCodeV2 = class {
+  constructor(transport) {
+    this.transport = transport;
+    this.requests = /* @__PURE__ */ new Map();
+    this.forms = /* @__PURE__ */ new Map();
+    this.failures = /* @__PURE__ */ new Map();
+  }
+  async page(root, path, signal) {
+    const data = [];
+    let cursor;
+    do {
+      const separator = path.includes("?") ? "&" : "?";
+      const page = await this.transport.rawRequest(root, `${path}${separator}${cursor ? `cursor=${encodeURIComponent(cursor)}` : "order=asc"}`, "GET", void 0, signal);
+      data.push(...page.data);
+      cursor = page.cursor.next;
+    } while (cursor);
+    return data;
+  }
+  async request(root, path, method, body, signal, timeoutMs) {
+    const raw = (path2, method2 = "GET", body2, deadline = 3e4) => this.transport.rawRequest(root, path2, method2, body2, signal, deadline);
+    if (path === "/global/health") return raw("/api/info");
+    if (path === "/provider") {
+      const config = await raw("/api/config");
+      const configured = /* @__PURE__ */ new Map();
+      for (const entry of config.filter((entry2) => entry2.type === "document")) {
+        for (const [id, provider] of Object.entries(entry.info.providers ?? {})) {
+          for (const [modelID, model] of Object.entries(provider.models ?? {})) {
+            configured.set(`${id}/${modelID}`, !model.disabled && /llama/i.test(`${modelID} ${model.name ?? ""}`));
+          }
+        }
+      }
+      const expected = [...configured].filter(([, enabled]) => enabled).map(([id]) => id);
+      const deadline = Date.now() + this.transport.startupMs;
+      for (; ; ) {
+        const [providers, models] = await Promise.all([raw("/api/provider"), raw("/api/model")]);
+        const present = new Set(models.data.filter((model) => model.enabled).map((model) => `${model.providerID}/${model.id}`));
+        if (expected.every((id) => present.has(id))) return v2Catalog(providers.data, models.data);
+        if (Date.now() >= deadline) throw new Error("OpenCode did not load the configured Llama models.");
+        await delay(100, void 0, { signal });
+      }
+    }
+    if (path === "/config") {
+      const { data: model } = await raw("/api/model/default");
+      return { model: model ? `${model.providerID}/${model.id}` : void 0 };
+    }
+    if (path === "/session") {
+      if (method === "GET") return (await this.page(root, "/api/session", signal)).map(v2Session);
+      const { permission: permission2, ...other } = body;
+      const result = await raw("/api/session", method, { ...other, location: { directory: root }, permissions: v2Rules(permission2 ?? []) });
+      return v2Session(result.data);
+    }
+    const session = /^\/session\/(ses_[A-Za-z0-9]+)(?:\/(message|abort|fork))?$/.exec(path);
+    if (session) {
+      const [, id, action] = session;
+      const base = `/api/session/${id}`;
+      if (!action) {
+        if (method === "GET") return v2Session((await raw(base)).data);
+        if (method === "DELETE") {
+          await raw(base, method);
+          return true;
+        }
+        const { permission: permission2, ...other } = body;
+        await raw(base, method, { ...other, ...permission2 ? { permissions: v2Rules(permission2) } : {} });
+        return;
+      }
+      if (action === "abort") return raw(`${base}/interrupt`, "POST");
+      if (action === "fork") return v2Session((await raw(`${base}/fork`, method, body.messageID ? { before: body.messageID } : {})).data);
+      if (method === "GET") return (await this.page(void 0, `${base}/message`, signal)).map((message) => v2Message(message, id));
+      await raw(`${base}/model`, "POST", { model: { providerID: body.model.providerID, id: body.model.modelID } });
+      await raw(`${base}/agent`, "POST", { agent: body.agent ?? "build" });
+      const instruction = `/api/experimental/session/${id}/instructions/entries/geckit`;
+      if (body.system) await raw(instruction, "PUT", { value: body.system });
+      else await raw(instruction, "DELETE");
+      await raw(`${base}/prompt`, "POST", { text: body.parts.map((part) => part.text).join("\n"), delivery: "steer" });
+      await raw(`/api/experimental/session/${id}/wait`, "POST", void 0, timeoutMs ?? 0);
+      const messages = await this.page(void 0, `${base}/message`, signal);
+      const assistant = messages.findLast((message) => message.type === "assistant");
+      const result = assistant ? v2Message(assistant, id) : { info: {}, parts: [] };
+      const idle = messages.findLast((message) => message.type === "idle");
+      if (idle?.outcome === "failed") result.info.error ??= this.failures.get(id) ?? { message: "OpenCode execution failed." };
+      if (idle?.outcome === "interrupted") result.info.error ??= { message: "OpenCode execution was interrupted." };
+      this.failures.delete(id);
+      return result;
+    }
+    const permission = /^\/permission\/([^/]+)\/reply$/.exec(path);
+    if (permission) {
+      const id = decodeURIComponent(permission[1]);
+      const owner = this.requests.get(id);
+      if (!owner) throw new Error("OpenCode permission request is no longer pending.");
+      await raw(`/api/session/${owner}/permission/${encodeURIComponent(id)}/reply`, "POST", { decision: body.reply });
+      this.requests.delete(id);
+      return true;
+    }
+    const question = /^\/question\/([^/]+)\/reply$/.exec(path);
+    if (question) {
+      const id = decodeURIComponent(question[1]);
+      const form = this.forms.get(id);
+      if (!form) throw new Error("OpenCode question is no longer pending.");
+      const answer = Object.fromEntries(form.fields.map((field, i) => {
+        const values = body.answers[i].map((label) => field.options?.find((option) => option.label === label)?.value ?? label);
+        return [field.key, field.type === "multiselect" ? values : values[0]];
+      }));
+      await raw(`/api/session/${form.sessionID}/form/${encodeURIComponent(id)}/reply`, "POST", { answer });
+      this.forms.delete(id);
+      return true;
+    }
+    if (path === "/mcp") {
+      const { data } = await raw("/api/mcp");
+      return Object.fromEntries(data.map((server) => [server.name, server.status]));
+    }
+    if (/^\/mcp\/[^/]+\/(connect|disconnect)$/.test(path)) return raw(`/api/experimental${path}`, method);
+    throw new Error(`OpenCode 2 operation is unsupported: ${method} ${path}`);
+  }
+  subscribe(root, hear, failed, signal, sessionID) {
+    return this.transport.subscribeAt(void 0, "/api/event", v2Events(hear, this.requests, this.forms, this.failures, sessionID), failed, signal);
+  }
+};
+
+// src/transport.mjs
 var OpenCodeTransport = class {
   constructor({ executable = process.env.GECKIT_OPENCODE_BIN ?? "opencode", launch = spawn, fetcher = fetch, startupMs = 15e3 } = {}) {
     this.executable = executable;
@@ -14,6 +278,7 @@ var OpenCodeTransport = class {
     this.startupMs = startupMs;
     this.disposed = false;
     this.requests = /* @__PURE__ */ new Set();
+    this.v2 = new OpenCodeV2(this);
   }
   start() {
     if (this.disposed) return Promise.reject(new Error("OpenCode library has been disposed."));
@@ -23,7 +288,7 @@ var OpenCodeTransport = class {
       const child = this.launch(this.executable, ["serve", "--hostname=127.0.0.1", "--port=0"], {
         stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true,
-        env: { ...process.env, OPENCODE_SERVER_USERNAME: "geckit", OPENCODE_SERVER_PASSWORD: this.password }
+        env: { ...process.env, OPENCODE_SERVER_USERNAME: "geckit", OPENCODE_SERVER_PASSWORD: this.password, OPENCODE_PASSWORD: this.password }
       });
       this.child = child;
       let output = "";
@@ -51,10 +316,7 @@ var OpenCodeTransport = class {
         output = (output + data.toString()).slice(-8192);
         const found = /(?:^|\n)(opencode )?server listening on (http:\/\/127\.0\.0\.1:\d+)/.exec(output);
         if (!found) return;
-        if (!found[1]) {
-          fail(new Error("OpenCode 2.x is not supported by this library. Use OpenCode 1.x (tested with 1.18.35)."));
-          return;
-        }
+        this.protocol = found[1] ? 1 : 2;
         const url = new URL(found[2]);
         if (url.port === "0") return;
         settled = true;
@@ -73,7 +335,7 @@ var OpenCodeTransport = class {
     const base = await this.start();
     if (signal?.aborted) throw signal.reason;
     const url = new URL(path, base);
-    if (root) url.searchParams.set("directory", root);
+    if (root) url.searchParams.set(this.protocol === 2 && url.pathname !== "/api/session" ? "location[directory]" : "directory", root);
     const controller = new AbortController();
     this.requests.add(controller);
     const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
@@ -86,7 +348,7 @@ var OpenCodeTransport = class {
       const response = await this.fetcher(url, {
         method,
         signal: combined,
-        headers: { Authorization: `Basic ${Buffer.from(`geckit:${this.password}`).toString("base64")}`, "Content-Type": "application/json" },
+        headers: { Authorization: `Basic ${Buffer.from(`${this.protocol === 2 ? "opencode" : "geckit"}:${this.password}`).toString("base64")}`, "Content-Type": "application/json" },
         ...body === void 0 ? {} : { body: JSON.stringify(body) }
       });
       if (!response.ok) {
@@ -100,6 +362,10 @@ var OpenCodeTransport = class {
     }
   }
   async request(root, path, method = "GET", body, signal, timeoutMs) {
+    await this.start();
+    return this.protocol === 2 ? this.v2.request(root, path, method, body, signal, timeoutMs) : this.rawRequest(root, path, method, body, signal, timeoutMs);
+  }
+  async rawRequest(root, path, method = "GET", body, signal, timeoutMs) {
     const { response, release } = await this.response(root, path, method, body, signal, timeoutMs);
     try {
       return response.status === 204 ? void 0 : await response.json();
@@ -107,8 +373,12 @@ var OpenCodeTransport = class {
       release();
     }
   }
-  async subscribe(root, hear, failed, signal) {
-    const { response, release, controller } = await this.response(root, "/event", "GET", void 0, signal);
+  async subscribe(root, hear, failed, signal, sessionID) {
+    await this.start();
+    return this.protocol === 2 ? this.v2.subscribe(root, hear, failed, signal, sessionID) : this.subscribeAt(root, "/event", hear, failed, signal);
+  }
+  async subscribeAt(root, path, hear, failed, signal) {
+    const { response, release, controller } = await this.response(root, path, "GET", void 0, signal);
     if (!response.body) {
       release();
       throw new Error("OpenCode event stream is missing.");
@@ -340,6 +610,10 @@ function holdOpenCode(provider, options, hear, left) {
       card(p.id, { kind: "other", tool: p.permission, detail }, shown);
     }
     if (type === "question.asked" && active && !requests.has(p.id)) {
+      if (p.error) {
+        fail(new Error(p.error));
+        return;
+      }
       const cards = /* @__PURE__ */ new Map();
       requests.set(p.id, { kind: "question", questions: p.questions, answers: [], cards });
       p.questions.forEach((question, index) => {
@@ -369,7 +643,7 @@ function holdOpenCode(provider, options, hear, left) {
       ready = void 0;
       stream = void 0;
       fail(error);
-    });
+    }, void 0, id);
     if (disposed) await stream.close();
   };
   const run = async (turn, text, images, before) => {

@@ -93,6 +93,7 @@ export function holdOpenCode(provider, options, hear, left) {
       card(p.id, { kind: 'other', tool: p.permission, detail }, shown)
     }
     if (type === 'question.asked' && active && !requests.has(p.id)) {
+      if (p.error) { fail(new Error(p.error)); return }
       const cards = new Map()
       requests.set(p.id, { kind: 'question', questions: p.questions, answers: [], cards })
       p.questions.forEach((question, index) => {
@@ -120,7 +121,7 @@ export function holdOpenCode(provider, options, hear, left) {
       ready = undefined
       stream = undefined
       fail(error)
-    })
+    }, undefined, id)
     if (disposed) await stream.close()
   }
   const run = async (turn, text, images, before) => {
