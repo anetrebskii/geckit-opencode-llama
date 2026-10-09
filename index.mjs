@@ -178,7 +178,7 @@ var OpenCodeV2 = class {
       for (const entry of config.filter((entry2) => entry2.type === "document")) {
         for (const [id, provider] of Object.entries(entry.info.providers ?? {})) {
           for (const [modelID, model] of Object.entries(provider.models ?? {})) {
-            configured.set(`${id}/${modelID}`, !model.disabled && /llama/i.test(`${modelID} ${model.name ?? ""}`));
+            configured.set(`${id}/${modelID}`, id === "ollama" && !provider.disabled && !model.disabled);
           }
         }
       }
@@ -187,8 +187,13 @@ var OpenCodeV2 = class {
       for (; ; ) {
         const [providers, models] = await Promise.all([raw("/api/provider"), raw("/api/model")]);
         const present = new Set(models.data.filter((model) => model.enabled).map((model) => `${model.providerID}/${model.id}`));
-        if (expected.every((id) => present.has(id))) return v2Catalog(providers.data, models.data);
-        if (Date.now() >= deadline) throw new Error("OpenCode did not load the configured Llama models.");
+        const catalog2 = v2Catalog(providers.data, models.data);
+        const ready = expected.every((id) => present.has(id));
+        if (ready && catalog2.all.some((provider) => provider.id === "ollama" && Object.keys(provider.models).length)) return catalog2;
+        if (Date.now() >= deadline) {
+          if (!ready) throw new Error("OpenCode did not load the configured Ollama models.");
+          return catalog2;
+        }
         await delay(100, void 0, { signal });
       }
     }
@@ -331,7 +336,7 @@ var OpenCodeTransport = class {
     return this.starting;
   }
   async response(root, path, method, body, signal, timeoutMs = 3e4) {
-    if (root?.startsWith("ssh://")) throw new Error("OpenCode (Llama) runs only on this computer.");
+    if (root?.startsWith("ssh://")) throw new Error("OpenCode + Ollama runs only on this computer.");
     const base = await this.start();
     if (signal?.aborted) throw signal.reason;
     const url = new URL(path, base);
@@ -429,7 +434,7 @@ var OpenCodeTransport = class {
 var family = "plugin:opencode-llama";
 var geckitId = (id) => `${family}:${id}`;
 function nativeId(id) {
-  if (typeof id !== "string" || !id.startsWith(`${family}:`) || !/^ses_[A-Za-z0-9]+$/.test(id.slice(family.length + 1))) throw new Error("Session does not belong to OpenCode (Llama).");
+  if (typeof id !== "string" || !id.startsWith(`${family}:`) || !/^ses_[A-Za-z0-9]+$/.test(id.slice(family.length + 1))) throw new Error("Session does not belong to OpenCode + Ollama.");
   return id.slice(family.length + 1);
 }
 var errorText = (error) => error?.data?.message ?? error?.message ?? "OpenCode request failed.";
@@ -439,7 +444,7 @@ var permissions = [
 ];
 function catalog(data, defaultModel) {
   const connected = new Set(data.connected ?? []);
-  return (data.all ?? []).filter((provider) => connected.has(provider.id)).flatMap((provider) => Object.entries(provider.models ?? {}).filter(([id, model]) => /llama/i.test(`${id} ${model.name ?? ""}`)).map(([id, model]) => {
+  return (data.all ?? []).filter((provider) => provider.id === "ollama" && connected.has(provider.id)).flatMap((provider) => Object.entries(provider.models ?? {}).map(([id, model]) => {
     const value = `${provider.id}/${id}`;
     const cost = model.cost;
     return {
@@ -768,9 +773,9 @@ function holdOpenCode(provider, options, hear, left) {
 }
 
 // src/provider.mjs
-var noModel = "No configured Llama model. Configure Ollama or another Llama provider in OpenCode.";
+var noModel = "No Ollama models available. Start Ollama and make a model available to OpenCode.";
 var local = (root) => {
-  if (root.startsWith("ssh://")) throw new Error("OpenCode (Llama) runs only on this computer.");
+  if (root.startsWith("ssh://")) throw new Error("OpenCode + Ollama runs only on this computer.");
   try {
     return realpathSync(resolve(root));
   } catch {
@@ -795,7 +800,7 @@ function create(_host, { transport = new OpenCodeTransport() } = {}) {
     async chooseModel(root, value) {
       const models = await provider.models(root);
       const model = value ? models.find((model2) => model2.value === value) : models.find((model2) => model2.isDefault) ?? models[0];
-      if (!model) throw new Error(value ? `Llama model is not configured: ${value}` : noModel);
+      if (!model) throw new Error(value ? `Ollama model is not available: ${value}` : noModel);
       return model;
     }
   };
@@ -811,8 +816,8 @@ function create(_host, { transport = new OpenCodeTransport() } = {}) {
   const provider = {
     id: family,
     family,
-    name: "OpenCode (Llama)",
-    shortName: "Llama",
+    name: "OpenCode + Ollama",
+    shortName: "Ollama",
     icon: "opencode-llama",
     browser: "none",
     loginCommand: "opencode auth login",
@@ -947,7 +952,7 @@ function create(_host, { transport = new OpenCodeTransport() } = {}) {
     clearGoal: async () => {
     },
     remote: async () => {
-      throw new Error("OpenCode (Llama) does not support remote control.");
+      throw new Error("OpenCode + Ollama does not support remote control.");
     },
     browsers: async () => void 0,
     async mcp(root, change) {

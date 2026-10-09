@@ -29,8 +29,8 @@ const server = createServer(async (request, response) => {
     const body = JSON.parse(text)
     requests.at(-1).tools = body.tools?.map((tool) => tool.function?.name)
     requests.at(-1).geckitInstructions = JSON.stringify(body.messages).includes('This conversation is running in GeckIt.')
-    assert.equal(body.model, 'llama-test')
-    const chunk = (delta, finish_reason = null) => ({ id: 'chatcmpl_test', object: 'chat.completion.chunk', created: 1, model: 'llama-test', choices: [{ index: 0, delta, finish_reason }] })
+    assert.equal(body.model, 'qwen-test')
+    const chunk = (delta, finish_reason = null) => ({ id: 'chatcmpl_test', object: 'chat.completion.chunk', created: 1, model: 'qwen-test', choices: [{ index: 0, delta, finish_reason }] })
     if (body.stream) {
       response.writeHead(200, { 'Content-Type': 'text/event-stream' })
       if (body.tools?.length && JSON.stringify(body.messages.findLast((message) => message.role === 'user')).includes('wait-for-stop')) {
@@ -64,11 +64,11 @@ const server = createServer(async (request, response) => {
         return
       }
       response.write(`data: ${JSON.stringify(chunk({ role: 'assistant', content: 'Mock ' }))}\n\n`)
-      response.write(`data: ${JSON.stringify(chunk({ content: 'Llama reply.' }))}\n\n`)
+      response.write(`data: ${JSON.stringify(chunk({ content: 'Ollama reply.' }))}\n\n`)
       response.end(`data: ${JSON.stringify({ ...chunk({}, 'stop'), usage: { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14 } })}\n\ndata: [DONE]\n\n`)
     } else {
       response.writeHead(200, { 'Content-Type': 'application/json' })
-      response.end(JSON.stringify({ id: 'chatcmpl_test', object: 'chat.completion', created: 1, model: 'llama-test', choices: [{ index: 0, message: { role: 'assistant', content: 'Mock Llama reply.' }, finish_reason: 'stop' }], usage: { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14 } }))
+      response.end(JSON.stringify({ id: 'chatcmpl_test', object: 'chat.completion', created: 1, model: 'qwen-test', choices: [{ index: 0, message: { role: 'assistant', content: 'Mock Ollama reply.' }, finish_reason: 'stop' }], usage: { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14 } }))
     }
   } else { response.writeHead(404); response.end('not found') }
 })
@@ -76,11 +76,11 @@ await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
 const port = server.address().port
 const v2 = /(?:^|\s)v?2\./.test(execFileSync(process.env.GECKIT_OPENCODE_BIN, ['--version'], { encoding: 'utf8' }))
 process.env.OPENCODE_CONFIG_CONTENT = JSON.stringify(v2 ? {
-  model: 'mock/llama-test',
-  providers: { mock: { package: '@opencode/ai/providers/openai-compatible', name: 'Mock Llama', settings: { baseURL: `http://127.0.0.1:${port}/v1` }, models: { 'llama-test': { name: 'Llama Test', limit: { context: 131072, output: 4096 } } } } },
+  model: 'ollama/qwen-test',
+  providers: { ollama: { package: '@opencode/ai/providers/openai-compatible', name: 'Mock Ollama', settings: { baseURL: `http://127.0.0.1:${port}/v1` }, models: { 'qwen-test': { name: 'Qwen Test', limit: { context: 131072, output: 4096 } } } } },
 } : {
-  model: 'mock/llama-test', small_model: 'mock/llama-test',
-  provider: { mock: { npm: '@ai-sdk/openai-compatible', name: 'Mock Llama', options: { baseURL: `http://127.0.0.1:${port}/v1` }, models: { 'llama-test': { name: 'Llama Test', limit: { context: 16384, output: 4096 } } } } },
+  model: 'ollama/qwen-test', small_model: 'ollama/qwen-test',
+  provider: { ollama: { npm: '@ai-sdk/openai-compatible', name: 'Mock Ollama', options: { baseURL: `http://127.0.0.1:${port}/v1` }, models: { 'qwen-test': { name: 'Qwen Test', limit: { context: 16384, output: 4096 } } } } },
 })
 const transport = new OpenCodeTransport()
 const provider = create({}, { transport })
@@ -89,12 +89,12 @@ let planDriver
 try {
   console.log('Program:', JSON.stringify(await provider.program()))
   const models = await provider.models(project)
-  assert.ok(models.some((model) => model.value === 'mock/llama-test'))
-  const id = await provider.create({ root: project, model: 'mock/llama-test' })
+  assert.ok(models.some((model) => model.value === 'ollama/qwen-test'))
+  const id = await provider.create({ root: project, model: 'ollama/qwen-test' })
   await provider.setInstructions(true)
   const heard = []
   let finishTurn
-  driver = provider.hold({ id, root: project, mode: 'manual', model: 'mock/llama-test', resume: true }, (event) => {
+  driver = provider.hold({ id, root: project, mode: 'manual', model: 'ollama/qwen-test', resume: true }, (event) => {
       heard.push(event)
       for (const signal of event.signals) if (signal.kind === 'asks') driver.answer(signal.ask, signal.wanted.kind === 'question' ? signal.wanted.choices[0] : 'once')
       const end = event.signals.find((signal) => signal.kind === 'ended')
@@ -108,7 +108,7 @@ try {
   const result = await turn('Read README.md, ask two questions, then say hello.')
   assert.equal(result.how, 'done', JSON.stringify(result))
   const saved = await provider.read(project, id)
-  assert.ok(saved.items.some((item) => item.kind === 'theirs' && item.text.includes('Mock Llama reply.')))
+  assert.ok(saved.items.some((item) => item.kind === 'theirs' && item.text.includes('Mock Ollama reply.')))
   assert.ok(heard.some((event) => event.items.some((item) => item.kind === 'theirs' && item.text.includes('Mock'))))
   assert.equal(heard.flatMap((event) => event.signals).filter((signal) => signal.kind === 'ended').length, 1)
   assert.ok(heard.flatMap((event) => event.signals).some((signal) => signal.kind === 'asks'), `Native permission card was received: ${JSON.stringify(requests)}`)
@@ -124,16 +124,16 @@ try {
   await driver.end()
   const listed = await provider.list([project])
   assert.ok(listed.some((row) => row.id === id))
-  const fork = await provider.fork(project, id, Date.now(), 'manual', 'mock/llama-test')
+  const fork = await provider.fork(project, id, Date.now(), 'manual', 'ollama/qwen-test')
   assert.ok(fork.items.some((item) => item.kind === 'theirs'))
   await provider.rename(id, 'Native smoke')
   assert.ok((await provider.search([project], 'hello')).length)
   await provider.delete(project, fork.id)
   await provider.delete(project, id)
-  const planId = await provider.create({ root: project, model: 'mock/llama-test' })
+  const planId = await provider.create({ root: project, model: 'ollama/qwen-test' })
   const planned = new Promise((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error('Native Plan turn timed out')), 60_000)
-    planDriver = provider.hold({ id: planId, root: project, mode: 'plan', model: 'mock/llama-test', resume: true }, (event) => {
+    planDriver = provider.hold({ id: planId, root: project, mode: 'plan', model: 'ollama/qwen-test', resume: true }, (event) => {
       const end = event.signals.find((signal) => signal.kind === 'ended')
       if (end) { clearTimeout(timeout); resolve(end) }
     }, () => {})
@@ -145,9 +145,9 @@ try {
   assert.ok((v2 ? native.permissions : native.permission).some((rule) => v2 ? rule.action === 'shell' && rule.effect === 'deny' : rule.permission === 'bash' && rule.action === 'deny'))
   await planDriver.end()
   await provider.delete(project, planId)
-  const corrected = await provider.correct('Correction fixture', 'Return corrected text', 'mock/llama-test')
+  const corrected = await provider.correct('Correction fixture', 'Return corrected text', 'ollama/qwen-test')
   assert.equal(corrected.ok, true, JSON.stringify(corrected))
-  assert.match(corrected.text, /Mock Llama reply/)
+  assert.match(corrected.text, /Mock Ollama reply/)
   const report = { version: (await provider.program()).version, models, completed: result, itemKinds: saved.items.map((item) => item.kind), mockRequests: requests, history: 'read/list/search/rename/fork/delete, permission, two question cards, Stop/continue, Plan denial, owned instructions and correction pass', root: base }
   await writeFile(join(base, 'result.json'), JSON.stringify(report, null, 2))
   console.log(JSON.stringify(report, null, 2))

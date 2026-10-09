@@ -55,7 +55,7 @@ export class OpenCodeTransport {
   }
 
   async response(root, path, method, body, signal, timeoutMs = 30_000) {
-    if (root?.startsWith('ssh://')) throw new Error('OpenCode (Llama) runs only on this computer.')
+    if (root?.startsWith('ssh://')) throw new Error('OpenCode + Ollama runs only on this computer.')
     const base = await this.start()
     if (signal?.aborted) throw signal.reason
     const url = new URL(path, base)

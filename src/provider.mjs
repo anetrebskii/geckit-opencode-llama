@@ -5,9 +5,9 @@ import { OpenCodeTransport } from './transport.mjs'
 import { holdOpenCode } from './driver.mjs'
 import { catalog, conversation, errorText, family, geckitId, linksIn, nativeId, permissions } from './transcript.mjs'
 
-const noModel = 'No configured Llama model. Configure Ollama or another Llama provider in OpenCode.'
+const noModel = 'No Ollama models available. Start Ollama and make a model available to OpenCode.'
 const local = (root) => {
-  if (root.startsWith('ssh://')) throw new Error('OpenCode (Llama) runs only on this computer.')
+  if (root.startsWith('ssh://')) throw new Error('OpenCode + Ollama runs only on this computer.')
   try { return realpathSync(resolve(root)) }
   catch { return resolve(root) }
 }
@@ -27,7 +27,7 @@ export function create(_host, { transport = new OpenCodeTransport() } = {}) {
     async chooseModel(root, value) {
       const models = await provider.models(root)
       const model = value ? models.find((model) => model.value === value) : models.find((model) => model.isDefault) ?? models[0]
-      if (!model) throw new Error(value ? `Llama model is not configured: ${value}` : noModel)
+      if (!model) throw new Error(value ? `Ollama model is not available: ${value}` : noModel)
       return model
     },
   }
@@ -41,7 +41,7 @@ export function create(_host, { transport = new OpenCodeTransport() } = {}) {
   }
   const missing = (error) => error.status === 404
   const provider = {
-    id: family, family, name: 'OpenCode (Llama)', shortName: 'Llama', icon: 'opencode-llama',
+    id: family, family, name: 'OpenCode + Ollama', shortName: 'Ollama', icon: 'opencode-llama',
     browser: 'none', loginCommand: 'opencode auth login', planName: '',
     localOnly: true, available: true, subscriptionOnly: false, images: false,
     remoteControl: false, nativeGoals: false, idleMs: 10 * 60_000, waitForExit: true,
@@ -143,7 +143,7 @@ export function create(_host, { transport = new OpenCodeTransport() } = {}) {
       } catch (error) { if (missing(error)) return false; throw error }
     },
     goal: async () => undefined, setGoal: async () => undefined, clearGoal: async () => {},
-    remote: async () => { throw new Error('OpenCode (Llama) does not support remote control.') },
+    remote: async () => { throw new Error('OpenCode + Ollama does not support remote control.') },
     browsers: async () => undefined,
     async mcp(root, change) {
       if (change) await transport.request(root, `/mcp/${encodeURIComponent(change.name)}/${change.enabled ? 'connect' : 'disconnect'}`, 'POST')

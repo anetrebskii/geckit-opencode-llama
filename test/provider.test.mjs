@@ -60,10 +60,11 @@ test('manifest, complete contract, inert creation and bundled entry', async (t) 
   assert.equal(nativeId(`${family}:ses_1`), 'ses_1')
 })
 
-test('Llama catalog reports backend capacity, zero prices and unknown quotas', async (t) => {
+test('Ollama catalog includes all families and reports backend capacity, zero prices and unknown quotas', async (t) => {
   const { provider, backend, launched } = setup(t)
   const models = await provider.models('/project')
-  assert.equal(models.length, 1)
+  assert.equal(models.length, 2)
+  assert.deepEqual(models.map((model) => model.value), ['ollama/llama3.1:8b', 'ollama/qwen3'])
   assert.equal(models[0].contextWindow, 16384)
   assert.equal(models[0].pricing.input, 0)
   assert.equal(models[0].supportsAutoMode, false)
@@ -74,11 +75,32 @@ test('Llama catalog reports backend capacity, zero prices and unknown quotas', a
   assert.equal((await provider.program()).version, '1.18.35')
   assert.equal(launched(), 1)
   assert.match(backend.calls[0].headers.Authorization, /^Basic /)
-  assert.equal(catalog({ all: [{ id: 'local', models: { llama: { name: 'Llama' } } }], connected: ['local'] })[0].contextWindow, undefined)
+  assert.equal(catalog({ all: [{ id: 'ollama', models: { llama: { name: 'Llama' } } }], connected: ['ollama'] })[0].contextWindow, undefined)
   backend.providers.connected = []
-  await assert.rejects(provider.create({ root: '/project' }), /No configured Llama/)
-  await assert.rejects(provider.create({ root: '/project', model: 'hosted/llama' }), /not configured/)
+  await assert.rejects(provider.create({ root: '/project' }), /No Ollama models/)
+  await assert.rejects(provider.create({ root: '/project', model: 'hosted/llama' }), /not available/)
   await assert.rejects(provider.create({ root: 'ssh://host/project' }), /only on this computer/)
+})
+
+test('conversation selection forwards non-Llama Ollama model and rejects other providers', async (t) => {
+  const { provider, backend } = setup(t)
+  backend.providers.connected.push('hosted')
+  assert.equal((await provider.models('/project')).some((model) => model.value.startsWith('hosted/')), false)
+  const selected = 'ollama/qwen3'
+  backend.config.model = selected
+  assert.equal((await provider.models('/project')).find((model) => model.isDefault).value, selected)
+  const id = await provider.create({ root: '/project', model: selected })
+  const driver = provider.hold({ id, root: '/project', mode: 'manual', resume: true, model: selected }, () => {}, () => {})
+  driver.send('selected model')
+  await until(() => backend.prompts.length === 1)
+  assert.deepEqual(backend.calls.findLast((call) => call.path.endsWith('/message')).body.model, { providerID: 'ollama', modelID: 'qwen3' })
+  backend.complete(backend.prompts[0])
+  await driver.end()
+  backend.config.model = 'hosted/llama'
+  assert.equal((await provider.models('/project')).find((model) => model.isDefault).value, 'ollama/llama3.1:8b')
+  delete backend.providers.all[0].models.qwen3
+  await assert.rejects(provider.create({ root: '/project', model: selected }), /Ollama model is not available/)
+  await assert.rejects(provider.create({ root: '/project', model: 'hosted/llama' }), /Ollama model is not available/)
 })
 
 test('stream user/assistant/delta/tool/thought, completion once, resumed turn and spend', async (t) => {

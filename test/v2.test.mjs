@@ -122,3 +122,27 @@ test('v2 consumes history pages and maps fork cutoff, owned replies and instruct
   await adapter.request('/project', '/session/ses_1/abort', 'POST')
   assert.equal(calls.at(-1).path, '/api/session/ses_1/interrupt')
 })
+
+test('v2 waits for asynchronous Ollama discovery on the first model request', async () => {
+  let polls = 0
+  const adapter = new OpenCodeV2({ startupMs: 500, async rawRequest(_root, path) {
+    if (path === '/api/config') return []
+    if (path === '/api/provider') return { data: [{ id: 'ollama' }] }
+    if (path === '/api/model') return { data: ++polls < 2 ? [] : [{ id: 'qwen3', providerID: 'ollama', enabled: true, name: 'Qwen 3', cost: [] }] }
+    throw new Error(path)
+  } })
+  const catalog = await adapter.request('/project', '/provider')
+  assert.deepEqual(Object.keys(catalog.all[0].models), ['qwen3'])
+  assert.equal(polls, 2)
+})
+
+test('v2 bounds empty discovery and errors when configured Ollama models never load', async () => {
+  let configured = false
+  const adapter = new OpenCodeV2({ startupMs: 0, async rawRequest(_root, path) {
+    if (path === '/api/config') return configured ? [{ type: 'document', info: { providers: { ollama: { models: { qwen3: {} } } } } }] : []
+    return { data: [] }
+  } })
+  assert.deepEqual((await adapter.request('/project', '/provider')).all, [])
+  configured = true
+  await assert.rejects(adapter.request('/project', '/provider'), /did not load the configured Ollama models/)
+})

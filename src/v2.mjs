@@ -31,7 +31,7 @@ export class OpenCodeV2 {
       for (const entry of config.filter((entry) => entry.type === 'document')) {
         for (const [id, provider] of Object.entries(entry.info.providers ?? {})) {
           for (const [modelID, model] of Object.entries(provider.models ?? {})) {
-            configured.set(`${id}/${modelID}`, !model.disabled && /llama/i.test(`${modelID} ${model.name ?? ''}`))
+            configured.set(`${id}/${modelID}`, id === 'ollama' && !provider.disabled && !model.disabled)
           }
         }
       }
@@ -40,8 +40,13 @@ export class OpenCodeV2 {
       for (;;) {
         const [providers, models] = await Promise.all([raw('/api/provider'), raw('/api/model')])
         const present = new Set(models.data.filter((model) => model.enabled).map((model) => `${model.providerID}/${model.id}`))
-        if (expected.every((id) => present.has(id))) return v2Catalog(providers.data, models.data)
-        if (Date.now() >= deadline) throw new Error('OpenCode did not load the configured Llama models.')
+        const catalog = v2Catalog(providers.data, models.data)
+        const ready = expected.every((id) => present.has(id))
+        if (ready && catalog.all.some((provider) => provider.id === 'ollama' && Object.keys(provider.models).length)) return catalog
+        if (Date.now() >= deadline) {
+          if (!ready) throw new Error('OpenCode did not load the configured Ollama models.')
+          return catalog
+        }
         await delay(100, undefined, { signal })
       }
     }

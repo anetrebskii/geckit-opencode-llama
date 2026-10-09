@@ -1,7 +1,7 @@
 export const family = 'plugin:opencode-llama'
 export const geckitId = (id) => `${family}:${id}`
 export function nativeId(id) {
-  if (typeof id !== 'string' || !id.startsWith(`${family}:`) || !/^ses_[A-Za-z0-9]+$/.test(id.slice(family.length + 1))) throw new Error('Session does not belong to OpenCode (Llama).')
+  if (typeof id !== 'string' || !id.startsWith(`${family}:`) || !/^ses_[A-Za-z0-9]+$/.test(id.slice(family.length + 1))) throw new Error('Session does not belong to OpenCode + Ollama.')
   return id.slice(family.length + 1)
 }
 export const errorText = (error) => error?.data?.message ?? error?.message ?? 'OpenCode request failed.'
@@ -12,8 +12,8 @@ export const permissions = [
 
 export function catalog(data, defaultModel) {
   const connected = new Set(data.connected ?? [])
-  return (data.all ?? []).filter((provider) => connected.has(provider.id)).flatMap((provider) =>
-    Object.entries(provider.models ?? {}).filter(([id, model]) => /llama/i.test(`${id} ${model.name ?? ''}`)).map(([id, model]) => {
+  return (data.all ?? []).filter((provider) => provider.id === 'ollama' && connected.has(provider.id)).flatMap((provider) =>
+    Object.entries(provider.models ?? {}).map(([id, model]) => {
       const value = `${provider.id}/${id}`
       const cost = model.cost
       return {
