@@ -565,12 +565,12 @@ function holdOpenCode(provider, options, hear, left) {
       }
       emit([], [{ kind: "spend", ...spend(info, capacity), ...measuredCost ? { cost, currency: "USD", costKind: "api-equivalent" } : {} }]);
     }
-    emit([...parts.values()].filter((part) => part.messageID === info.id).map((part) => partItem(part, info)).filter(Boolean));
+    emit([...parts.values()].filter((part) => part.messageID === info.id).map((part) => partItem(part, info)).filter((item) => item && item.kind !== "mine"));
   };
   const updatePart = (part) => {
     parts.set(part.id, part);
     const item = partItem(part, messages.get(part.messageID));
-    if (item) emit([item], item.kind === "did" && item.live ? [{ kind: "doing", what: item.what }] : []);
+    if (item && item.kind !== "mine") emit([item], item.kind === "did" && item.live ? [{ kind: "doing", what: item.what }] : []);
   };
   const card = (ask, wanted, shown) => {
     emit([{ kind: "card", id: `card:${ask}`, card: shown }], [{ kind: "asks", ask, wanted }]);
@@ -655,7 +655,7 @@ function holdOpenCode(provider, options, hear, left) {
     try {
       await stopping;
       if (active !== turn || disposed) return;
-      if (images?.length) throw new Error("OpenCode (Llama) accepts text only.");
+      if (images?.length) throw new Error("OpenCode + Ollama accepts text only.");
       ready ??= prepare().catch((error) => {
         ready = void 0;
         throw error;

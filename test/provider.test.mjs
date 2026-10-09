@@ -103,14 +103,15 @@ test('conversation selection forwards non-Llama Ollama model and rejects other p
   await assert.rejects(provider.create({ root: '/project', model: 'hosted/llama' }), /Ollama model is not available/)
 })
 
-test('stream user/assistant/delta/tool/thought, completion once, resumed turn and spend', async (t) => {
+test('stream assistant/delta/tool/thought without user echo, completion once, resumed turn and spend', async (t) => {
   const { provider, backend } = setup(t)
   const id = await provider.create({ root: '/project' })
   const h = held(provider, id)
   h.driver.send('hello', undefined, ['command result'])
   await until(() => backend.prompts.length === 1)
   await until(() => h.items().some((item) => item.text === 'Hello'))
-  assert.equal(h.items().find((item) => item.kind === 'mine').text, 'command result\n\nhello')
+  assert.equal(h.items().some((item) => item.kind === 'mine'), false)
+  assert.equal(backend.prompts[0].body.parts[0].text, 'command result\n\nhello')
   const prompt = backend.prompts[0]
   const base = { sessionID: prompt.id, messageID: prompt.info.id }
   backend.emit(prompt.id, 'message.part.updated', { part: { ...base, id: 'prt_thought', type: 'reasoning', text: 'Thinking' } })
@@ -140,6 +141,35 @@ test('stream user/assistant/delta/tool/thought, completion once, resumed turn an
   await h.driver.end()
   assert.equal(h.left(), 1)
   assert.equal(backend.streams.size, 0)
+})
+
+test('late native user snapshots do not duplicate optimistic messages or collapse identical turns', async (t) => {
+  const { provider, backend } = setup(t)
+  const id = await provider.create({ root: '/project' })
+  const original = backend.emit.bind(backend)
+  backend.emit = (session, type, properties = {}) => {
+    if (properties.info?.role === 'user' || properties.part?.messageID.startsWith('msg_user')) return
+    original(session, type, properties)
+  }
+  const shown = new Map()
+  let completed = 0
+  const driver = provider.hold({ id, root: '/project', mode: 'manual', resume: true }, (event) => {
+    completed += event.signals.filter((signal) => signal.kind === 'ended').length
+    for (const gone of event.gone) shown.delete(gone)
+    for (const item of event.items) shown.set(item.id, item)
+  }, () => {})
+  for (let turn = 0; turn < 2; turn++) {
+    shown.set(`optimistic:${turn}`, { kind: 'mine', id: `optimistic:${turn}`, text: 'What?' })
+    driver.send('What?')
+    await until(() => backend.prompts.length === turn + 1)
+    backend.complete(backend.prompts[turn])
+    await until(() => completed === turn + 1)
+    assert.deepEqual([...shown.values()].filter((item) => item.kind === 'mine' || item.kind === 'theirs').map((item) => item.kind), Array.from({ length: turn + 1 }, () => ['mine', 'theirs']).flat())
+  }
+  await driver.end()
+  const saved = await provider.read('/project', id)
+  assert.deepEqual(saved.items.filter((item) => item.kind === 'mine' || item.kind === 'theirs').map((item) => item.kind), ['mine', 'theirs', 'mine', 'theirs'])
+  assert.deepEqual(saved.items.filter((item) => item.kind === 'mine').map((item) => item.text), ['What?', 'What?'])
 })
 
 test('permission mapping and multiple question cards use native request IDs', async (t) => {

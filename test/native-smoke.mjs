@@ -108,6 +108,8 @@ try {
   const result = await turn('Read README.md, ask two questions, then say hello.')
   assert.equal(result.how, 'done', JSON.stringify(result))
   const saved = await provider.read(project, id)
+  assert.equal(heard.flatMap((event) => event.items).some((item) => item.kind === 'mine'), false, 'GeckIt already displays submitted user messages')
+  assert.equal(saved.items.filter((item) => item.kind === 'mine').length, 1, 'Native history retains one submitted message')
   assert.ok(saved.items.some((item) => item.kind === 'theirs' && item.text.includes('Mock Ollama reply.')))
   assert.ok(heard.some((event) => event.items.some((item) => item.kind === 'theirs' && item.text.includes('Mock'))))
   assert.equal(heard.flatMap((event) => event.signals).filter((signal) => signal.kind === 'ended').length, 1)

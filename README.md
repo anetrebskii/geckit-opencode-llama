@@ -40,7 +40,7 @@ The repository includes `geckit-plugin.json` and a prebuilt `index.mjs` at its r
 
 ## Behavior
 
-- Streams text, reasoning and tool activity, including incremental text updates.
+- Streams text, reasoning and tool activity, including incremental text updates. GeckIt displays submitted user messages immediately; the live driver does not echo them again when native history arrives. Saved OpenCode history retains every submission, including repeated identical messages.
 - Supports approval replies and questions with several question cards, including OpenCode 2 question forms. Each card submits one selected label or a custom answer; multi-select questions currently accept one selection per card. Other form types report an explicit unsupported-form error.
 - **Manual** asks before tools run. Allow for session remembers matching permission patterns only for that conversation until the library unloads; native replies remain once so other conversations cannot inherit the grant. **Plan** uses OpenCode's plan agent and denies editing tools and shell execution. **Auto** runs as Manual; the library does not offer an automatic safety reviewer.
 - Native listing includes OpenCode sessions in each exact project folder, including terminal sessions and sessions originally using another model. Follow-up messages use the Ollama model selected in GeckIt. Search, read, rename, fork, links and deletion use native OpenCode history. Deleting a conversation removes it from OpenCode too.
