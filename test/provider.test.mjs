@@ -18,7 +18,7 @@ const until = async (condition) => {
   }
   throw new Error('Condition timed out')
 }
-function setup(t) {
+function setup(t, context = {}) {
   const backend = new Backend()
   let launches = 0
   let killed = 0
@@ -34,7 +34,7 @@ function setup(t) {
     return child
   }
   const transport = new OpenCodeTransport({ launch, fetcher: backend.fetch })
-  const provider = create({}, { transport })
+  const provider = create(context, { transport })
   t.after(() => provider.dispose())
   return { provider, transport, backend, launched: () => launches, killed: () => killed }
 }
@@ -44,6 +44,35 @@ function held(provider, id, mode = 'manual') {
   const driver = provider.hold({ id, root: '/project', mode, resume: true }, (event) => heard.push(event), () => left++)
   return { driver, heard, left: () => left, signals: () => heard.flatMap((heard) => heard.signals), items: () => heard.flatMap((heard) => heard.items) }
 }
+
+test('logs cached limits and transport/turn outcomes without prompts or backend bodies', async (t) => {
+  const logs = []
+  const { provider, backend, transport } = setup(t, { log: { write: (level, event, fields) => logs.push({ level, event, fields }) } })
+  const models = await provider.models('/project')
+  const calls = backend.calls.length
+  await provider.limits(models.map((model) => model.value))
+  assert.equal(backend.calls.length, calls, 'limits do not make backend requests')
+  assert.equal(logs.find((one) => one.event === 'limits.cache.returned').fields.backendCheck, false)
+  const h = held(provider, await provider.create({ root: '/project' }))
+  h.driver.send('PRIVATE PROMPT', undefined, ['PRIVATE COMMAND OUTPUT'])
+  await until(() => backend.prompts.length === 1)
+  backend.complete(backend.prompts[0], 'PRIVATE BACKEND ERROR')
+  await until(() => h.signals().some((signal) => signal.kind === 'ended'))
+  assert.equal(logs.find((one) => one.event === 'session.turn.ended').fields.outcome, 'failed')
+  transport.fetcher = async () => new Response('PRIVATE HTTP BODY', { status: 500 })
+  await assert.rejects(transport.request('/PRIVATE ROOT', '/session/private-id/message?private=query'), /PRIVATE HTTP BODY/)
+  assert(logs.some((one) => one.event === 'transport.request.failed' && one.fields.status === 500))
+  await h.driver.end()
+  const serialized = JSON.stringify(logs)
+  for (const privateText of ['PRIVATE', 'private-id', 'private=query', transport.password]) assert.equal(serialized.includes(privateText), false, privateText)
+  for (const event of ['provider.created', 'transport.starting', 'transport.started', 'transport.request.started', 'transport.request.completed', 'message.send.requested', 'session.closed']) assert(logs.some((one) => one.event === event), event)
+})
+
+test('unavailable plugin logger does not affect provider operations', async (t) => {
+  const { provider } = setup(t, { log: { write: () => { throw new Error('Cannot write logs') } } })
+  assert((await provider.models('/project')).length > 0)
+  assert((await provider.limits(['ollama/llama3.1:8b'])).windows.has('ollama/llama3.1:8b'))
+})
 
 test('manifest, complete contract, inert creation and bundled entry', async (t) => {
   const { provider, launched } = setup(t)

@@ -53,6 +53,12 @@ The repository includes `geckit-plugin.json` and a prebuilt `index.mjs` at its r
 
 ## Development and checks
 
+### Logs
+
+Updated GeckIt hosts pass a scoped logger to `create(context)`. This library records server startup/disposal, HTTP request outcomes and turn/send outcomes without prompts, replies, authorization headers or backend bodies. Limits are remembered model capacities: `limits.cache.returned` explicitly reports `backendCheck: false`; it does not contact a remote quota service. Missing logging on older hosts is a no-op.
+
+The file is `<GeckIt userData>/provider-logs/plugin-opencode-llama.jsonl`, with one `.jsonl.1` backup (2 MiB each). On macOS the installed app uses `~/Library/Application Support/geckit/`; development uses `geckit-local/`. Full logger contract and other platform paths are in the [provider guide](https://github.com/anetrebskii/geckit/blob/main/docs/provider-plugins.md#local-diagnostic-logs).
+
 Node 22+:
 
 ```sh

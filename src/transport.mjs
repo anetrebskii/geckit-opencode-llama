@@ -11,11 +11,14 @@ export class OpenCodeTransport {
     this.disposed = false
     this.requests = new Set()
     this.v2 = new OpenCodeV2(this)
+    this.log = () => {}
+    this.sequence = 0
   }
 
   start() {
     if (this.disposed) return Promise.reject(new Error('OpenCode library has been disposed.'))
     if (this.starting) return this.starting
+    this.log('info', 'transport.starting')
     this.password = randomBytes(24).toString('hex')
     this.starting = new Promise((resolve, reject) => {
       const child = this.launch(this.executable, ['serve', '--hostname=127.0.0.1', '--port=0'], {
@@ -25,7 +28,9 @@ export class OpenCodeTransport {
       this.child = child
       let output = ''
       let settled = false
+      let failureLogged = false
       const fail = (error) => {
+        if (!failureLogged) { failureLogged = true; this.log('warn', 'transport.failed', { errorKind: error.name ?? 'Error' }) }
         clearTimeout(timer)
         if (!settled) { settled = true; reject(error) }
         if (this.child === child) { this.child = undefined; this.starting = undefined }
@@ -46,11 +51,14 @@ export class OpenCodeTransport {
         if (url.port === '0') return
         settled = true
         clearTimeout(timer)
+        this.log('info', 'transport.started', { protocol: this.protocol })
         resolve(url.origin)
       })
     })
     const pending = this.starting
-    void pending.catch(() => { if (this.starting === pending) this.starting = undefined })
+    void pending.catch(() => {
+      if (this.starting === pending) { this.starting = undefined; this.log('warn', 'transport.start.failed') }
+    })
     return this.starting
   }
 
@@ -59,6 +67,10 @@ export class OpenCodeTransport {
     const base = await this.start()
     if (signal?.aborted) throw signal.reason
     const url = new URL(path, base)
+    const requestId = ++this.sequence
+    const began = Date.now()
+    const resource = url.pathname.split('/').filter(Boolean)[url.pathname.startsWith('/api/') ? 1 : 0] ?? 'root'
+    this.log('debug', 'transport.request.started', { requestId, method, resource, protocol: this.protocol })
     if (root) url.searchParams.set(this.protocol === 2 && url.pathname !== '/api/session' ? 'location[directory]' : 'directory', root)
     const controller = new AbortController()
     this.requests.add(controller)
@@ -75,8 +87,12 @@ export class OpenCodeTransport {
         const detail = (await response.text()).slice(0, 2000)
         throw Object.assign(new Error(`OpenCode ${method} ${url.pathname}: ${response.status} ${detail}`), { status: response.status })
       }
+      this.log('debug', 'transport.request.completed', { requestId, status: response.status, durationMs: Date.now() - began })
       return { response, release, controller }
-    } catch (error) { release(); throw error }
+    } catch (error) {
+      this.log('warn', 'transport.request.failed', { requestId, errorKind: error.name ?? 'Error', status: error.status ?? null, durationMs: Date.now() - began })
+      release(); throw error
+    }
   }
 
   async request(root, path, method = 'GET', body, signal, timeoutMs) {
@@ -127,6 +143,7 @@ export class OpenCodeTransport {
   }
 
   dispose() {
+    this.log('info', 'transport.disposed')
     this.disposed = true
     for (const controller of this.requests) controller.abort(new Error('OpenCode library disposed.'))
     this.child?.kill()

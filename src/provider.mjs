@@ -12,11 +12,14 @@ const local = (root) => {
   catch { return resolve(root) }
 }
 
-export function create(_host, { transport = new OpenCodeTransport() } = {}) {
+export function create(context = {}, { transport = new OpenCodeTransport() } = {}) {
+  const log = (level, event, fields) => { try { context.log?.write(level, event, fields) } catch {} }
+  transport.log = log
+  log('info', 'provider.created')
   const roots = new Map()
   const windows = new Map()
   const state = {
-    transport, drivers: new Set(), grants: new Map(), instructions: undefined,
+    transport, log, drivers: new Set(), grants: new Map(), instructions: undefined,
     async session(root, id) {
       const native = nativeId(id)
       const saved = await transport.request(root, `/session/${native}`)
@@ -61,7 +64,10 @@ export function create(_host, { transport = new OpenCodeTransport() } = {}) {
       for (const model of models) if (model.contextWindow !== undefined) windows.set(model.value, model.contextWindow)
       return models
     },
-    async limits(models) { return { windows: new Map(models.map((id) => [id, windows.get(id)])) } },
+    async limits(models) {
+      log('debug', 'limits.cache.returned', { models: models.length, knownWindows: models.filter((id) => windows.has(id)).length, backendCheck: false })
+      return { windows: new Map(models.map((id) => [id, windows.get(id)])) }
+    },
     async create({ root, model }) {
       local(root)
       await state.chooseModel(root, model)
@@ -179,6 +185,7 @@ export function create(_host, { transport = new OpenCodeTransport() } = {}) {
       state.instructions = enabled ? `This conversation is running in GeckIt. Use ${command} for board and conversation operations; run ${command} instructions app to read app guidance. Follow project AGENTS.md instructions. Never fabricate session links or claim unsupported native goals.` : undefined
     },
     dispose() {
+      log('info', 'provider.disposed')
       for (const driver of state.drivers) void driver.end()
       transport.dispose()
     },

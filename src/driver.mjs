@@ -26,6 +26,7 @@ export function holdOpenCode(provider, options, hear, left) {
   const finish = (turn, how, text) => {
     if (active !== turn) return
     active = undefined
+    provider.log?.(how === 'failed' ? 'warn' : 'info', 'session.turn.ended', { session: options.id, outcome: how })
     for (const ask of [...requests.keys()]) resolveRequest(ask, how === 'stopped' ? 'Stopped' : 'Turn ended')
     emit([], [{ kind: 'ended', how, ...(text === undefined ? {} : { text }) }])
   }
@@ -144,12 +145,14 @@ export function holdOpenCode(provider, options, hear, left) {
       if (active !== turn || disposed) return
       emit([], [{ kind: 'started', session: geckitId(id), model: model.value, key: false, mode }])
       turn.prompted = true
+      provider.log?.('info', 'message.send.requested', { session: options.id })
       const result = await transport.request(root, `/session/${id}/message`, 'POST', {
         model: { providerID: model.value.slice(0, slash), modelID: model.value.slice(slash + 1) },
         agent: mode === 'plan' ? 'plan' : 'build',
         ...(provider.instructions ? { system: provider.instructions } : {}),
         parts: [{ type: 'text', text: [...(before ?? []), text].join('\n\n') }],
       }, turn.controller.signal, 0)
+      provider.log?.('info', 'message.send.completed', { session: options.id })
       if (active !== turn || disposed) return
       const saved = await transport.request(root, `/session/${id}/message`, 'GET', undefined, turn.controller.signal)
       if (active !== turn || disposed) return
@@ -184,6 +187,7 @@ export function holdOpenCode(provider, options, hear, left) {
       if (active) throw new Error('OpenCode is already answering this conversation.')
       const turn = { controller: new AbortController() }
       active = turn
+      provider.log?.('info', 'session.turn.begun', { session: options.id })
       turn.done = run(turn, text, images, before)
     },
     answer(ask, answer) {
@@ -225,6 +229,7 @@ export function holdOpenCode(provider, options, hear, left) {
         await ready?.catch(() => {})
         await stream?.close()
         provider.drivers.delete(driver)
+        provider.log?.('info', 'session.closed', { session: options.id })
         left()
       })()
       return ending

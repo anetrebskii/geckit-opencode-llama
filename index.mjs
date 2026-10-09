@@ -284,10 +284,14 @@ var OpenCodeTransport = class {
     this.disposed = false;
     this.requests = /* @__PURE__ */ new Set();
     this.v2 = new OpenCodeV2(this);
+    this.log = () => {
+    };
+    this.sequence = 0;
   }
   start() {
     if (this.disposed) return Promise.reject(new Error("OpenCode library has been disposed."));
     if (this.starting) return this.starting;
+    this.log("info", "transport.starting");
     this.password = randomBytes(24).toString("hex");
     this.starting = new Promise((resolve2, reject) => {
       const child = this.launch(this.executable, ["serve", "--hostname=127.0.0.1", "--port=0"], {
@@ -298,7 +302,12 @@ var OpenCodeTransport = class {
       this.child = child;
       let output = "";
       let settled = false;
+      let failureLogged = false;
       const fail = (error) => {
+        if (!failureLogged) {
+          failureLogged = true;
+          this.log("warn", "transport.failed", { errorKind: error.name ?? "Error" });
+        }
         clearTimeout(timer);
         if (!settled) {
           settled = true;
@@ -326,12 +335,16 @@ var OpenCodeTransport = class {
         if (url.port === "0") return;
         settled = true;
         clearTimeout(timer);
+        this.log("info", "transport.started", { protocol: this.protocol });
         resolve2(url.origin);
       });
     });
     const pending = this.starting;
     void pending.catch(() => {
-      if (this.starting === pending) this.starting = void 0;
+      if (this.starting === pending) {
+        this.starting = void 0;
+        this.log("warn", "transport.start.failed");
+      }
     });
     return this.starting;
   }
@@ -340,6 +353,10 @@ var OpenCodeTransport = class {
     const base = await this.start();
     if (signal?.aborted) throw signal.reason;
     const url = new URL(path, base);
+    const requestId = ++this.sequence;
+    const began = Date.now();
+    const resource = url.pathname.split("/").filter(Boolean)[url.pathname.startsWith("/api/") ? 1 : 0] ?? "root";
+    this.log("debug", "transport.request.started", { requestId, method, resource, protocol: this.protocol });
     if (root) url.searchParams.set(this.protocol === 2 && url.pathname !== "/api/session" ? "location[directory]" : "directory", root);
     const controller = new AbortController();
     this.requests.add(controller);
@@ -360,8 +377,10 @@ var OpenCodeTransport = class {
         const detail = (await response.text()).slice(0, 2e3);
         throw Object.assign(new Error(`OpenCode ${method} ${url.pathname}: ${response.status} ${detail}`), { status: response.status });
       }
+      this.log("debug", "transport.request.completed", { requestId, status: response.status, durationMs: Date.now() - began });
       return { response, release, controller };
     } catch (error) {
+      this.log("warn", "transport.request.failed", { requestId, errorKind: error.name ?? "Error", status: error.status ?? null, durationMs: Date.now() - began });
       release();
       throw error;
     }
@@ -424,6 +443,7 @@ var OpenCodeTransport = class {
     } };
   }
   dispose() {
+    this.log("info", "transport.disposed");
     this.disposed = true;
     for (const controller of this.requests) controller.abort(new Error("OpenCode library disposed."));
     this.child?.kill();
@@ -540,6 +560,7 @@ function holdOpenCode(provider, options, hear, left) {
   const finish = (turn, how, text) => {
     if (active !== turn) return;
     active = void 0;
+    provider.log?.(how === "failed" ? "warn" : "info", "session.turn.ended", { session: options.id, outcome: how });
     for (const ask of [...requests.keys()]) resolveRequest(ask, how === "stopped" ? "Stopped" : "Turn ended");
     emit([], [{ kind: "ended", how, ...text === void 0 ? {} : { text } }]);
   };
@@ -674,12 +695,14 @@ function holdOpenCode(provider, options, hear, left) {
       if (active !== turn || disposed) return;
       emit([], [{ kind: "started", session: geckitId(id), model: model.value, key: false, mode }]);
       turn.prompted = true;
+      provider.log?.("info", "message.send.requested", { session: options.id });
       const result = await transport.request(root, `/session/${id}/message`, "POST", {
         model: { providerID: model.value.slice(0, slash), modelID: model.value.slice(slash + 1) },
         agent: mode === "plan" ? "plan" : "build",
         ...provider.instructions ? { system: provider.instructions } : {},
         parts: [{ type: "text", text: [...before ?? [], text].join("\n\n") }]
       }, turn.controller.signal, 0);
+      provider.log?.("info", "message.send.completed", { session: options.id });
       if (active !== turn || disposed) return;
       const saved = await transport.request(root, `/session/${id}/message`, "GET", void 0, turn.controller.signal);
       if (active !== turn || disposed) return;
@@ -720,6 +743,7 @@ function holdOpenCode(provider, options, hear, left) {
       if (active) throw new Error("OpenCode is already answering this conversation.");
       const turn = { controller: new AbortController() };
       active = turn;
+      provider.log?.("info", "session.turn.begun", { session: options.id });
       turn.done = run(turn, text, images, before);
     },
     answer(ask, answer) {
@@ -766,6 +790,7 @@ function holdOpenCode(provider, options, hear, left) {
         });
         await stream?.close();
         provider.drivers.delete(driver);
+        provider.log?.("info", "session.closed", { session: options.id });
         left();
       })();
       return ending;
@@ -785,11 +810,20 @@ var local = (root) => {
     return resolve(root);
   }
 };
-function create(_host, { transport = new OpenCodeTransport() } = {}) {
+function create(context = {}, { transport = new OpenCodeTransport() } = {}) {
+  const log = (level, event, fields) => {
+    try {
+      context.log?.write(level, event, fields);
+    } catch {
+    }
+  };
+  transport.log = log;
+  log("info", "provider.created");
   const roots = /* @__PURE__ */ new Map();
   const windows = /* @__PURE__ */ new Map();
   const state = {
     transport,
+    log,
     drivers: /* @__PURE__ */ new Set(),
     grants: /* @__PURE__ */ new Map(),
     instructions: void 0,
@@ -853,6 +887,7 @@ function create(_host, { transport = new OpenCodeTransport() } = {}) {
       return models;
     },
     async limits(models) {
+      log("debug", "limits.cache.returned", { models: models.length, knownWindows: models.filter((id) => windows.has(id)).length, backendCheck: false });
       return { windows: new Map(models.map((id) => [id, windows.get(id)])) };
     },
     async create({ root, model }) {
@@ -998,6 +1033,7 @@ ${text}` }]
       state.instructions = enabled ? `This conversation is running in GeckIt. Use ${command} for board and conversation operations; run ${command} instructions app to read app guidance. Follow project AGENTS.md instructions. Never fabricate session links or claim unsupported native goals.` : void 0;
     },
     dispose() {
+      log("info", "provider.disposed");
       for (const driver of state.drivers) void driver.end();
       transport.dispose();
     }
