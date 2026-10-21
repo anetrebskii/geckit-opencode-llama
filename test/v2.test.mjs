@@ -117,7 +117,7 @@ test('v2 consumes history pages and maps fork cutoff, owned replies and instruct
   }, undefined, 0)
   assert.equal(result.parts[1].text, 'Hello')
   assert.ok(calls.some((call) => call.path.endsWith('/instructions/entries/geckit') && call.method === 'DELETE'))
-  assert.ok(calls.some((call) => call.path.endsWith('/wait') && call.timeout === 0))
+  assert.ok(calls.some((call) => call.path.endsWith('/wait') && call.timeout === 60_000))
   assert.ok(calls.some((call) => call.path.endsWith('/model') && call.body.model.id === 'llama'))
   await adapter.request('/project', '/session/ses_1/abort', 'POST')
   assert.equal(calls.at(-1).path, '/api/session/ses_1/interrupt')

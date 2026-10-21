@@ -46,6 +46,7 @@ The repository includes `geckit-plugin.json` and a prebuilt `index.mjs` at its r
 - **Manual** asks before tools run. Allow for session remembers matching permission patterns only for that conversation until the library unloads; native replies remain once so other conversations cannot inherit the grant. **Plan** uses OpenCode's plan agent and denies editing tools and shell execution. **Auto** runs as Manual; the library does not offer an automatic safety reviewer.
 - Native listing includes OpenCode sessions in each exact project folder, including terminal sessions and sessions originally using another model. Follow-up messages use the Ollama model selected in GeckIt. Search, read, rename, fork, links and deletion use native OpenCode history. Deleting a conversation removes it from OpenCode too.
 - Stop cancels the current generation; another message can follow. Unloading stops owned drivers and server. No other OpenCode server is reused or stopped.
+- OpenCode 2 renews its completion wait every minute so long-running work survives the HTTP client's five-minute header deadline. Transient connection errors and HTTP 429/500/502/503/504 retry safe reads and completion waits up to three times, after 1, 2 and 4 seconds. Prompt submission, tools and approval replies are never replayed. Stop and unload cancel pending retries. Native model errors and disconnected event streams still report failure.
 - Reports context and costs from OpenCode. Costs are API-equivalent estimates, not a verified bill; unknown quotas remain omitted. Metadata reflects OpenCode's model catalog.
 - GeckIt instruction switch adds an owned system prompt on subsequent messages; disabling it removes that prompt. OpenCode 2 stores it as a session-owned instruction entry. Project instruction files are untouched.
 - Text correction uses a temporary native session with all tools denied, then removes it.
@@ -56,6 +57,8 @@ The repository includes `geckit-plugin.json` and a prebuilt `index.mjs` at its r
 ### Logs
 
 Updated GeckIt hosts pass a scoped logger to `create(context)`. This library records server startup/disposal, HTTP request outcomes and turn/send outcomes without prompts, replies, authorization headers or backend bodies. Limits are remembered model capacities: `limits.cache.returned` explicitly reports `backendCheck: false`; it does not contact a remote quota service. Missing logging on older hosts is a no-op.
+
+`transport.request.retry` records retry count, delay and failure code/status. `session.wait.renewed` records expected completion-observer renewal; these renewals are debug events and do not mean model generation failed.
 
 The file is `<GeckIt userData>/provider-logs/plugin-opencode-llama.jsonl`, with one `.jsonl.1` backup (2 MiB each). On macOS the installed app uses `~/Library/Application Support/geckit/`; development uses `geckit-local/`. Full logger contract and other platform paths are in the [provider guide](https://github.com/anetrebskii/geckit/blob/main/docs/provider-plugins.md#local-diagnostic-logs).
 

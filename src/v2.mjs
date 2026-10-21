@@ -3,11 +3,27 @@ import { v2Catalog, v2Message, v2Rules, v2Session } from './v2-transcript.mjs'
 import { setTimeout as delay } from 'node:timers/promises'
 
 export class OpenCodeV2 {
-  constructor(transport) {
+  constructor(transport, waitMs = 60_000) {
     this.transport = transport
+    this.waitMs = waitMs
     this.requests = new Map()
     this.forms = new Map()
     this.failures = new Map()
+  }
+
+  async wait(root, id, signal, timeoutMs) {
+    const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : Infinity
+    for (;;) {
+      signal?.throwIfAborted()
+      const remaining = deadline - Date.now()
+      try {
+        await this.transport.rawRequest(root, `/api/experimental/session/${id}/wait`, 'POST', undefined, signal, Math.max(1, Math.min(this.waitMs, remaining)))
+        return
+      } catch (error) {
+        if (signal?.aborted || error.code !== 'GECKIT_REQUEST_TIMEOUT' || Date.now() >= deadline) throw error
+        this.transport.log?.('debug', 'session.wait.renewed')
+      }
+    }
   }
 
   async page(root, path, signal) {
@@ -80,7 +96,7 @@ export class OpenCodeV2 {
       if (body.system) await raw(instruction, 'PUT', { value: body.system })
       else await raw(instruction, 'DELETE')
       await raw(`${base}/prompt`, 'POST', { text: body.parts.map((part) => part.text).join('\n'), delivery: 'steer' })
-      await raw(`/api/experimental/session/${id}/wait`, 'POST', undefined, timeoutMs ?? 0)
+      await this.wait(root, id, signal, timeoutMs)
       const messages = await this.page(undefined, `${base}/message`, signal)
       const assistant = messages.findLast((message) => message.type === 'assistant')
       const result = assistant ? v2Message(assistant, id) : { info: {}, parts: [] }

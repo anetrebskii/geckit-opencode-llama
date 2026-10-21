@@ -1,16 +1,23 @@
 import { spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
+import { setTimeout as delay } from 'node:timers/promises'
 import { OpenCodeV2 } from './v2.mjs'
 
+const retryCodes = new Set(['ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'ETIMEDOUT', 'EAI_AGAIN', 'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT'])
+const retryable = (error) => [429, 500, 502, 503, 504].includes(error.status) || retryCodes.has(error.code) || retryCodes.has(error.cause?.code) || (error.name === 'TypeError' && error.message === 'fetch failed')
+const timeoutError = () => Object.assign(new Error('OpenCode request timed out.'), { code: 'GECKIT_REQUEST_TIMEOUT' })
+
 export class OpenCodeTransport {
-  constructor({ executable = process.env.GECKIT_OPENCODE_BIN ?? 'opencode', launch = spawn, fetcher = fetch, startupMs = 15_000 } = {}) {
+  constructor({ executable = process.env.GECKIT_OPENCODE_BIN ?? 'opencode', launch = spawn, fetcher = fetch, startupMs = 15_000, retryDelays = [1000, 2000, 4000], waitMs = 60_000 } = {}) {
     this.executable = executable
     this.launch = launch
     this.fetcher = fetcher
     this.startupMs = startupMs
     this.disposed = false
     this.requests = new Set()
-    this.v2 = new OpenCodeV2(this)
+    this.lifetime = new AbortController()
+    this.retryDelays = retryDelays
+    this.v2 = new OpenCodeV2(this, waitMs)
     this.log = () => {}
     this.sequence = 0
   }
@@ -75,7 +82,7 @@ export class OpenCodeTransport {
     const controller = new AbortController()
     this.requests.add(controller)
     const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal
-    const timer = timeoutMs > 0 ? setTimeout(() => controller.abort(new Error('OpenCode request timed out.')), timeoutMs) : undefined
+    const timer = timeoutMs > 0 ? setTimeout(() => controller.abort(timeoutError()), timeoutMs) : undefined
     const release = () => { clearTimeout(timer); this.requests.delete(controller) }
     try {
       const response = await this.fetcher(url, {
@@ -90,7 +97,7 @@ export class OpenCodeTransport {
       this.log('debug', 'transport.request.completed', { requestId, status: response.status, durationMs: Date.now() - began })
       return { response, release, controller }
     } catch (error) {
-      this.log('warn', 'transport.request.failed', { requestId, errorKind: error.name ?? 'Error', status: error.status ?? null, durationMs: Date.now() - began })
+      this.log(error.code === 'GECKIT_REQUEST_TIMEOUT' ? 'debug' : 'warn', 'transport.request.failed', { requestId, errorKind: error.name ?? 'Error', errorCode: error.code ?? error.cause?.code ?? null, status: error.status ?? null, durationMs: Date.now() - began })
       release(); throw error
     }
   }
@@ -101,9 +108,23 @@ export class OpenCodeTransport {
   }
 
   async rawRequest(root, path, method = 'GET', body, signal, timeoutMs) {
-    const { response, release } = await this.response(root, path, method, body, signal, timeoutMs)
-    try { return response.status === 204 ? undefined : await response.json() }
-    finally { release() }
+    const safe = method === 'GET' || (method === 'POST' && /^\/api\/experimental\/session\/ses_[A-Za-z0-9]+\/wait$/.test(path))
+    const combined = signal ? AbortSignal.any([signal, this.lifetime.signal]) : this.lifetime.signal
+    const deadline = timeoutMs === 0 ? Infinity : Date.now() + (timeoutMs ?? 30_000)
+    for (let attempt = 0; ; attempt++) {
+      combined.throwIfAborted()
+      if (Date.now() >= deadline) throw timeoutError()
+      try {
+        const { response, release } = await this.response(root, path, method, body, combined, deadline === Infinity ? 0 : Math.max(1, deadline - Date.now()))
+        try { return response.status === 204 ? undefined : await response.json() }
+        finally { release() }
+      } catch (error) {
+        if (combined.aborted || !safe || !retryable(error) || attempt >= this.retryDelays.length) throw error
+        const delayMs = Math.max(0, Math.min(this.retryDelays[attempt], deadline - Date.now()))
+        this.log('info', 'transport.request.retry', { method, attempt: attempt + 1, delayMs, errorCode: error.code ?? error.cause?.code ?? null, status: error.status ?? null })
+        await delay(delayMs, undefined, { signal: combined })
+      }
+    }
   }
 
   async subscribe(root, hear, failed, signal, sessionID) {
@@ -145,6 +166,7 @@ export class OpenCodeTransport {
   dispose() {
     this.log('info', 'transport.disposed')
     this.disposed = true
+    this.lifetime.abort(new Error('OpenCode library disposed.'))
     for (const controller of this.requests) controller.abort(new Error('OpenCode library disposed.'))
     this.child?.kill()
   }

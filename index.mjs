@@ -6,6 +6,7 @@ import { resolve } from "node:path";
 // src/transport.mjs
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { setTimeout as delay2 } from "node:timers/promises";
 
 // src/v2-transcript.mjs
 var v2Rules = (rules) => rules.map((rule) => ({ action: rule.permission === "bash" ? "shell" : rule.permission, resource: rule.pattern, effect: rule.action }));
@@ -152,11 +153,26 @@ function v2Events(hear, requests, forms, failures, ownedSession) {
 // src/v2.mjs
 import { setTimeout as delay } from "node:timers/promises";
 var OpenCodeV2 = class {
-  constructor(transport) {
+  constructor(transport, waitMs = 6e4) {
     this.transport = transport;
+    this.waitMs = waitMs;
     this.requests = /* @__PURE__ */ new Map();
     this.forms = /* @__PURE__ */ new Map();
     this.failures = /* @__PURE__ */ new Map();
+  }
+  async wait(root, id, signal, timeoutMs) {
+    const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : Infinity;
+    for (; ; ) {
+      signal?.throwIfAborted();
+      const remaining = deadline - Date.now();
+      try {
+        await this.transport.rawRequest(root, `/api/experimental/session/${id}/wait`, "POST", void 0, signal, Math.max(1, Math.min(this.waitMs, remaining)));
+        return;
+      } catch (error) {
+        if (signal?.aborted || error.code !== "GECKIT_REQUEST_TIMEOUT" || Date.now() >= deadline) throw error;
+        this.transport.log?.("debug", "session.wait.renewed");
+      }
+    }
   }
   async page(root, path, signal) {
     const data = [];
@@ -230,7 +246,7 @@ var OpenCodeV2 = class {
       if (body.system) await raw(instruction, "PUT", { value: body.system });
       else await raw(instruction, "DELETE");
       await raw(`${base}/prompt`, "POST", { text: body.parts.map((part) => part.text).join("\n"), delivery: "steer" });
-      await raw(`/api/experimental/session/${id}/wait`, "POST", void 0, timeoutMs ?? 0);
+      await this.wait(root, id, signal, timeoutMs);
       const messages = await this.page(void 0, `${base}/message`, signal);
       const assistant = messages.findLast((message) => message.type === "assistant");
       const result = assistant ? v2Message(assistant, id) : { info: {}, parts: [] };
@@ -275,15 +291,20 @@ var OpenCodeV2 = class {
 };
 
 // src/transport.mjs
+var retryCodes = /* @__PURE__ */ new Set(["ECONNRESET", "ECONNREFUSED", "EPIPE", "ETIMEDOUT", "EAI_AGAIN", "UND_ERR_SOCKET", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT"]);
+var retryable = (error) => [429, 500, 502, 503, 504].includes(error.status) || retryCodes.has(error.code) || retryCodes.has(error.cause?.code) || error.name === "TypeError" && error.message === "fetch failed";
+var timeoutError = () => Object.assign(new Error("OpenCode request timed out."), { code: "GECKIT_REQUEST_TIMEOUT" });
 var OpenCodeTransport = class {
-  constructor({ executable = process.env.GECKIT_OPENCODE_BIN ?? "opencode", launch = spawn, fetcher = fetch, startupMs = 15e3 } = {}) {
+  constructor({ executable = process.env.GECKIT_OPENCODE_BIN ?? "opencode", launch = spawn, fetcher = fetch, startupMs = 15e3, retryDelays = [1e3, 2e3, 4e3], waitMs = 6e4 } = {}) {
     this.executable = executable;
     this.launch = launch;
     this.fetcher = fetcher;
     this.startupMs = startupMs;
     this.disposed = false;
     this.requests = /* @__PURE__ */ new Set();
-    this.v2 = new OpenCodeV2(this);
+    this.lifetime = new AbortController();
+    this.retryDelays = retryDelays;
+    this.v2 = new OpenCodeV2(this, waitMs);
     this.log = () => {
     };
     this.sequence = 0;
@@ -361,7 +382,7 @@ var OpenCodeTransport = class {
     const controller = new AbortController();
     this.requests.add(controller);
     const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
-    const timer = timeoutMs > 0 ? setTimeout(() => controller.abort(new Error("OpenCode request timed out.")), timeoutMs) : void 0;
+    const timer = timeoutMs > 0 ? setTimeout(() => controller.abort(timeoutError()), timeoutMs) : void 0;
     const release = () => {
       clearTimeout(timer);
       this.requests.delete(controller);
@@ -380,7 +401,7 @@ var OpenCodeTransport = class {
       this.log("debug", "transport.request.completed", { requestId, status: response.status, durationMs: Date.now() - began });
       return { response, release, controller };
     } catch (error) {
-      this.log("warn", "transport.request.failed", { requestId, errorKind: error.name ?? "Error", status: error.status ?? null, durationMs: Date.now() - began });
+      this.log(error.code === "GECKIT_REQUEST_TIMEOUT" ? "debug" : "warn", "transport.request.failed", { requestId, errorKind: error.name ?? "Error", errorCode: error.code ?? error.cause?.code ?? null, status: error.status ?? null, durationMs: Date.now() - began });
       release();
       throw error;
     }
@@ -390,11 +411,25 @@ var OpenCodeTransport = class {
     return this.protocol === 2 ? this.v2.request(root, path, method, body, signal, timeoutMs) : this.rawRequest(root, path, method, body, signal, timeoutMs);
   }
   async rawRequest(root, path, method = "GET", body, signal, timeoutMs) {
-    const { response, release } = await this.response(root, path, method, body, signal, timeoutMs);
-    try {
-      return response.status === 204 ? void 0 : await response.json();
-    } finally {
-      release();
+    const safe = method === "GET" || method === "POST" && /^\/api\/experimental\/session\/ses_[A-Za-z0-9]+\/wait$/.test(path);
+    const combined = signal ? AbortSignal.any([signal, this.lifetime.signal]) : this.lifetime.signal;
+    const deadline = timeoutMs === 0 ? Infinity : Date.now() + (timeoutMs ?? 3e4);
+    for (let attempt = 0; ; attempt++) {
+      combined.throwIfAborted();
+      if (Date.now() >= deadline) throw timeoutError();
+      try {
+        const { response, release } = await this.response(root, path, method, body, combined, deadline === Infinity ? 0 : Math.max(1, deadline - Date.now()));
+        try {
+          return response.status === 204 ? void 0 : await response.json();
+        } finally {
+          release();
+        }
+      } catch (error) {
+        if (combined.aborted || !safe || !retryable(error) || attempt >= this.retryDelays.length) throw error;
+        const delayMs = Math.max(0, Math.min(this.retryDelays[attempt], deadline - Date.now()));
+        this.log("info", "transport.request.retry", { method, attempt: attempt + 1, delayMs, errorCode: error.code ?? error.cause?.code ?? null, status: error.status ?? null });
+        await delay2(delayMs, void 0, { signal: combined });
+      }
     }
   }
   async subscribe(root, hear, failed, signal, sessionID) {
@@ -445,6 +480,7 @@ var OpenCodeTransport = class {
   dispose() {
     this.log("info", "transport.disposed");
     this.disposed = true;
+    this.lifetime.abort(new Error("OpenCode library disposed."));
     for (const controller of this.requests) controller.abort(new Error("OpenCode library disposed."));
     this.child?.kill();
   }
