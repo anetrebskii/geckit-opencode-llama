@@ -10,6 +10,23 @@ export const permissions = [
   { permission: 'question', pattern: '*', action: 'allow' },
 ]
 
+/**
+ * The rules Auto runs under, in OpenCode's own word.
+ *
+ * OpenCode takes the last rule that matches, so the wildcard that asks comes
+ * first and the tools that may run on their own come after it. What only reads
+ * is let through; what changes something is still asked about, because there is
+ * no reviewer here to say otherwise.
+ */
+export const autoPermissions = [
+  { permission: '*', pattern: '*', action: 'ask' },
+  ...['read', 'glob', 'grep', 'list', 'question'].map((permission) => ({ permission, pattern: '*', action: 'allow' })),
+]
+
+/** Whether Auto lets this kind of tool run on its own, as its own rules say. */
+export const autoAllows = (permission) =>
+  autoPermissions.some((rule) => rule.permission === permission && rule.action === 'allow')
+
 export function catalog(data, defaultModel) {
   const connected = new Set(data.connected ?? [])
   return (data.all ?? []).filter((provider) => provider.id === 'ollama' && connected.has(provider.id)).flatMap((provider) =>

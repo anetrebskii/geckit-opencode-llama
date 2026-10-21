@@ -1,4 +1,4 @@
-import { errorText, geckitId, nativeId, partItem, permissions, spend } from './transcript.mjs'
+import { autoAllows, autoPermissions, errorText, geckitId, nativeId, partItem, permissions, spend } from './transcript.mjs'
 
 export function holdOpenCode(provider, options, hear, left) {
   const id = nativeId(options.id)
@@ -14,7 +14,7 @@ export function holdOpenCode(provider, options, hear, left) {
   let disposed = false
   let active
   let stream
-  let mode = options.mode === 'plan' ? 'plan' : 'manual'
+  let mode = options.mode === 'plan' ? 'plan' : options.mode === 'auto' ? 'auto' : 'manual'
   let cost = 0
   let measuredCost = false
   let stopping = Promise.resolve()
@@ -137,7 +137,9 @@ export function holdOpenCode(provider, options, hear, left) {
       if (active !== turn || disposed) return
       capacity = model.contextWindow
       const slash = model.value.indexOf('/')
-      const rules = mode === 'plan' ? [...permissions, ...['edit', 'write', 'apply_patch', 'bash'].map((permission) => ({ permission, pattern: '*', action: 'deny' }))] : permissions
+      const rules = mode === 'plan'
+        ? [...permissions, ...['edit', 'write', 'apply_patch', 'bash'].map((permission) => ({ permission, pattern: '*', action: 'deny' }))]
+        : mode === 'auto' ? autoPermissions : permissions
       if (appliedMode !== mode) {
         await transport.request(root, `/session/${id}`, 'PATCH', { permission: rules }, turn.controller.signal)
         appliedMode = mode
@@ -215,10 +217,17 @@ export function holdOpenCode(provider, options, hear, left) {
         }
       })().catch((error) => { if (active === turn) fail(error) })
     },
-    permit(_mode, again) {
-      mode = 'manual'
+    permit(chosen, again) {
+      mode = chosen === 'auto' ? 'auto' : 'manual'
       emit([], [{ kind: 'mode', mode }])
-      for (const ask of again) driver.answer(ask, 'once')
+      // What was waiting is looked at again under the mode now in force: what
+      // this mode allows on its own is allowed, and the rest is asked about again.
+      for (const ask of again) {
+        const request = requests.get(ask)
+        if (request?.kind !== 'permission') { driver.answer(ask, 'once'); continue }
+        if (mode === 'auto' && autoAllows(request.permission)) driver.answer(ask, 'once')
+        else { emit([], [{ kind: 'asks', ask, wanted: { kind: 'other', tool: request.permission, detail: request.patterns.join('\n') } }]) }
+      }
     },
     stop() { void stop() },
     end() {

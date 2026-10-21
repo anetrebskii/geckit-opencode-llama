@@ -498,6 +498,11 @@ var permissions = [
   { permission: "*", pattern: "*", action: "ask" },
   { permission: "question", pattern: "*", action: "allow" }
 ];
+var autoPermissions = [
+  { permission: "*", pattern: "*", action: "ask" },
+  ...["read", "glob", "grep", "list", "question"].map((permission) => ({ permission, pattern: "*", action: "allow" }))
+];
+var autoAllows = (permission) => autoPermissions.some((rule) => rule.permission === permission && rule.action === "allow");
 function catalog(data, defaultModel) {
   const connected = new Set(data.connected ?? []);
   return (data.all ?? []).filter((provider) => provider.id === "ollama" && connected.has(provider.id)).flatMap((provider) => Object.entries(provider.models ?? {}).map(([id, model]) => {
@@ -584,7 +589,7 @@ function holdOpenCode(provider, options, hear, left) {
   let disposed = false;
   let active;
   let stream;
-  let mode = options.mode === "plan" ? "plan" : "manual";
+  let mode = options.mode === "plan" ? "plan" : options.mode === "auto" ? "auto" : "manual";
   let cost = 0;
   let measuredCost = false;
   let stopping = Promise.resolve();
@@ -723,7 +728,7 @@ function holdOpenCode(provider, options, hear, left) {
       if (active !== turn || disposed) return;
       capacity = model.contextWindow;
       const slash = model.value.indexOf("/");
-      const rules = mode === "plan" ? [...permissions, ...["edit", "write", "apply_patch", "bash"].map((permission) => ({ permission, pattern: "*", action: "deny" }))] : permissions;
+      const rules = mode === "plan" ? [...permissions, ...["edit", "write", "apply_patch", "bash"].map((permission) => ({ permission, pattern: "*", action: "deny" }))] : mode === "auto" ? autoPermissions : permissions;
       if (appliedMode !== mode) {
         await transport.request(root, `/session/${id}`, "PATCH", { permission: rules }, turn.controller.signal);
         appliedMode = mode;
@@ -809,10 +814,20 @@ function holdOpenCode(provider, options, hear, left) {
         if (active === turn) fail(error);
       });
     },
-    permit(_mode, again) {
-      mode = "manual";
+    permit(chosen, again) {
+      mode = chosen === "auto" ? "auto" : "manual";
       emit([], [{ kind: "mode", mode }]);
-      for (const ask of again) driver.answer(ask, "once");
+      for (const ask of again) {
+        const request = requests.get(ask);
+        if (request?.kind !== "permission") {
+          driver.answer(ask, "once");
+          continue;
+        }
+        if (mode === "auto" && autoAllows(request.permission)) driver.answer(ask, "once");
+        else {
+          emit([], [{ kind: "asks", ask, wanted: { kind: "other", tool: request.permission, detail: request.patterns.join("\n") } }]);
+        }
+      }
     },
     stop() {
       void stop();

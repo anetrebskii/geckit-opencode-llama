@@ -259,7 +259,7 @@ test('stop during preparation prevents a late prompt', async (t) => {
   assert.equal(h.signals().filter((signal) => signal.kind === 'ended').length, 1)
 })
 
-test('Plan denies mutating tools, auto is manual, owned instruction toggle', async (t) => {
+test('Plan denies mutating tools, Auto lets only what reads run, owned instruction toggle', async (t) => {
   const { provider, backend } = setup(t)
   const id = await provider.create({ root: '/project' })
   await provider.setInstructions(true, {})
@@ -277,7 +277,13 @@ test('Plan denies mutating tools, auto is manual, owned instruction toggle', asy
   auto.driver.send('task')
   await until(() => backend.prompts.length === 2)
   assert.equal(backend.prompts[1].body.system, undefined)
-  assert.equal(auto.signals().find((signal) => signal.kind === 'started').mode, 'manual')
+  assert.equal(auto.signals().find((signal) => signal.kind === 'started').mode, 'auto')
+  const rules = backend.calls.findLast((call) => call.method === 'PATCH').body.permission
+  assert.ok(rules.some((rule) => rule.permission === 'read' && rule.action === 'allow'), 'read runs on its own')
+  assert.ok(rules.some((rule) => rule.permission === 'grep' && rule.action === 'allow'), 'grep runs on its own')
+  assert.ok(!rules.some((rule) => rule.permission === 'edit' && rule.action === 'allow'), 'edit is still asked about')
+  assert.ok(rules.some((rule) => rule.permission === '*' && rule.action === 'ask'), 'anything else is asked about')
+  assert.equal(rules.at(-1).permission, 'question')
   backend.complete(backend.prompts[1])
   await auto.driver.end()
 })
@@ -436,6 +442,24 @@ test('OpenCode 2 startup banner selects its native adapter across output chunks'
   }
   finally { transport.dispose() }
   assert.equal(killed, true)
+})
+
+test('switching to Auto lets what only reads run and asks about the rest again', async (t) => {
+  const { provider, backend } = setup(t)
+  const id = await provider.create({ root: '/project' })
+  const h = held(provider, id)
+  h.driver.send('task')
+  await until(() => backend.prompts.length === 1)
+  backend.emit('ses_1', 'permission.asked', { id: 'perm_read', permission: 'read', patterns: ['README.md'] })
+  backend.emit('ses_1', 'permission.asked', { id: 'perm_shell', permission: 'bash', patterns: ['npm test'] })
+  await until(() => h.signals().some((signal) => signal.ask === 'perm_read'))
+  await until(() => h.signals().some((signal) => signal.ask === 'perm_shell'))
+  h.driver.permit('auto', ['perm_read', 'perm_shell'])
+  await until(() => backend.calls.some((call) => call.path === '/permission/perm_read/reply'))
+  assert.ok(!backend.calls.some((call) => call.path === '/permission/perm_shell/reply'), 'what changes something is still asked about')
+  assert.equal(h.signals().find((signal) => signal.kind === 'mode').mode, 'auto')
+  assert.ok(h.signals().some((signal) => signal.kind === 'asks' && signal.ask === 'perm_shell'), 'it is asked about again')
+  await h.driver.end()
 })
 
 test('session allowances stay in one conversation and use once at the native boundary', async (t) => {
